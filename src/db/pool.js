@@ -9,8 +9,20 @@ const { Pool, types } = pg;
 // Ensure 64-bit int8 is parsed as string to prevent JS float precision loss
 types.setTypeParser(20, (val) => val);
 
+function getSslConfig(url) {
+  if (!url) return undefined;
+  if (url.includes('sslmode=disable') || url.includes('127.0.0.1') || url.includes('localhost')) {
+    return undefined;
+  }
+  if (url.includes('sslmode=require') || url.includes('render.com') || url.includes('neon.tech') || url.includes('supabase.co')) {
+    return { rejectUnauthorized: false };
+  }
+  return undefined;
+}
+
 export const pool = new Pool({
   connectionString: config.db.runtimeUrl,
+  ssl: getSslConfig(config.db.runtimeUrl),
   max: config.db.poolMax,
   connectionTimeoutMillis: 3000,
   idleTimeoutMillis: 30000,
@@ -22,6 +34,7 @@ pool.on('error', (err) => {
 
 export const migratorPool = new Pool({
   connectionString: config.db.migratorUrl,
+  ssl: getSslConfig(config.db.migratorUrl),
   max: 2,
   connectionTimeoutMillis: 5000,
 });
@@ -32,6 +45,7 @@ migratorPool.on('error', (err) => {
 
 export const workerPool = new Pool({
   connectionString: config.db.runtimeUrl,
+  ssl: getSslConfig(config.db.runtimeUrl),
   max: config.db.workerPoolMax,
   connectionTimeoutMillis: 5000,
 });

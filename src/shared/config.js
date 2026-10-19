@@ -36,7 +36,7 @@ export const config = {
 
   db: {
     runtimeUrl: getEnv('DATABASE_URL', 'postgres://app_runtime:runtime_dev_password@127.0.0.1:5435/operations', true),
-    migratorUrl: getEnv('MIGRATION_DATABASE_URL', 'postgres://app_migrator:migrator_dev_password@127.0.0.1:5435/operations', true),
+    migratorUrl: getEnv('MIGRATION_DATABASE_URL', getEnv('DATABASE_URL', 'postgres://app_migrator:migrator_dev_password@127.0.0.1:5435/operations')),
     adminUrl: getEnv('ADMIN_DATABASE_URL', 'postgres://postgres:postgres_dev_password@127.0.0.1:5435/operations'),
     backupUrl: getEnv('BACKUP_DATABASE_URL', 'postgres://app_backup:backup_dev_password@127.0.0.1:5435/operations'),
     poolMax: getIntEnv('POOL_MAX', 10),
