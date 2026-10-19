@@ -10,6 +10,15 @@ An operational coordination and work-item management platform engineered for hig
 
 ---
 
+## 🚀 Live Demo
+
+**Live Application:** [Operations Under Pressure](https://operations-under-pressure-eight.vercel.app/)
+
+Explore the deployed application to experience the operational work management interface, including work-item coordination and team workflows.
+
+> Note: The live frontend may depend on backend and database services being configured and available in the deployed environment.
+
+
 ## 1. Quickstart & Setup
 
 ### Prerequisites
