@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_workspace_invitations_ws ON workspace_invitations
 -- 5. Seed default workspace for Newtonite (id = 1) if not exists
 INSERT INTO workspaces (id, name, slug, created_by)
 OVERRIDING SYSTEM VALUE
-VALUES (1, 'Newtonite Engineering', 'newtonite', 1)
+VALUES (1, 'Newtonite Engineering', 'newtonite', (SELECT id FROM users ORDER BY id LIMIT 1))
 ON CONFLICT (id) DO NOTHING;
 
 -- Synchronize identity sequence so next auto-increment id starts at 2
