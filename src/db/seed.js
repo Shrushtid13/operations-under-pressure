@@ -16,8 +16,21 @@ export async function hashPassword(plainText) {
 }
 
 export async function seedDatabase(options = { bulk: false }, attempts = 3) {
-  if (config.isProduction) {
-    throw new Error('Refusing to seed database when NODE_ENV is production');
+  if (config.isProduction && !process.env.ALLOW_PROD_SEED) {
+    const clientCheck = await migratorPool.connect();
+    try {
+      const { rows } = await clientCheck.query("SELECT COUNT(*) as count FROM users WHERE email LIKE '%@newtonite.test'");
+      if (parseInt(rows[0]?.count || '0', 10) > 0) {
+        logger.info('Database already contains seeded demo users; skipping seed in production.');
+        return;
+      }
+      logger.info('Production environment detected with unseeded database. Proceeding with initial seed...');
+    } catch (err) {
+      logger.warn({ err }, 'Could not check existing users count; skipping seed in production for safety');
+      return;
+    } finally {
+      clientCheck.release();
+    }
   }
 
   logger.info('Seeding database...');

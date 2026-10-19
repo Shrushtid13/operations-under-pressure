@@ -12,4 +12,10 @@ CREATE INDEX IF NOT EXISTS idx_work_items_due_at
   WHERE status IN ('open', 'in_progress', 'pending_approval') AND due_at IS NOT NULL;
 
 -- 3. Grants for managing and clearing deadline reminder notifications
-GRANT DELETE ON notifications TO app_runtime;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    GRANT DELETE ON notifications TO app_runtime;
+  END IF;
+END $$;
+

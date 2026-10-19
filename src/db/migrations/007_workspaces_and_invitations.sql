@@ -61,7 +61,13 @@ WHERE u.id <= 5
 ON CONFLICT (workspace_id, user_id) DO NOTHING;
 
 -- Grants for app_runtime least privilege role
-GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces TO app_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON workspace_memberships TO app_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON workspace_invitations TO app_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces TO app_runtime;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON workspace_memberships TO app_runtime;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON workspace_invitations TO app_runtime;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+  END IF;
+END $$;
+

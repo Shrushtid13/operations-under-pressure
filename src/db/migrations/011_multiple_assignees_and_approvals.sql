@@ -25,4 +25,10 @@ WHERE assignee_id IS NOT NULL
 ON CONFLICT (work_item_id, user_id) DO NOTHING;
 
 -- Grant permissions to app_runtime
-GRANT SELECT, INSERT, UPDATE, DELETE ON work_item_assignees TO app_runtime;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    GRANT SELECT, INSERT, UPDATE, DELETE ON work_item_assignees TO app_runtime;
+  END IF;
+END $$;
+

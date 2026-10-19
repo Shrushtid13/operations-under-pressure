@@ -20,5 +20,11 @@ BEFORE UPDATE OR DELETE ON team_messages
 FOR EACH ROW EXECUTE FUNCTION trg_prevent_modification();
 
 -- Least privilege permissions for runtime
-GRANT SELECT, INSERT ON team_messages TO app_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    GRANT SELECT, INSERT ON team_messages TO app_runtime;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+  END IF;
+END $$;
+

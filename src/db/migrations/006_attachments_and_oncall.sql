@@ -58,5 +58,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_user_call
   WHERE call_id IS NOT NULL;
 
 -- 5. Grants for runtime app
-GRANT SELECT, INSERT, UPDATE, DELETE ON work_item_attachments, operational_calls, on_call_shifts TO app_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+    GRANT SELECT, INSERT, UPDATE, DELETE ON work_item_attachments, operational_calls, on_call_shifts TO app_runtime;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+  END IF;
+END $$;
+
