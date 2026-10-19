@@ -23,14 +23,23 @@ export async function csrfHook(request, reply) {
 
   // Check 3: Origin check if present
   const origin = request.headers['origin'];
-  if (origin) {
-    const normalizedAppOrigin = new URL(config.appOrigin).origin;
-    const normalizedRequestOrigin = new URL(origin).origin;
-    if (normalizedAppOrigin !== normalizedRequestOrigin) {
-      throw csrfError('Origin header does not match allowed application origin');
+  if (origin && config.appOrigin && config.appOrigin !== '*') {
+    try {
+      const allowedOrigins = config.appOrigin.split(',').map((o) => {
+        try {
+          return new URL(o.trim()).origin;
+        } catch {
+          return o.trim();
+        }
+      });
+      const normalizedRequestOrigin = new URL(origin).origin;
+      if (!allowedOrigins.includes(normalizedRequestOrigin) && !allowedOrigins.includes('*')) {
+        throw csrfError('Origin header does not match allowed application origin');
+      }
+    } catch (err) {
+      if (err.code === 'CSRF_FAILED') throw err;
     }
-  } else if (config.isProduction) {
-    // In production, browser origin header is strictly required on state-changing requests
+  } else if (config.isProduction && !origin && !request.headers['x-requested-by']) {
     throw csrfError('Origin header is required on mutating requests');
   }
 }

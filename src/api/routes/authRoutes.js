@@ -33,7 +33,7 @@ export default async function authRoutes(fastify) {
     reply.setCookie('session_token', token, {
       path: '/',
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: config.isProduction ? 'none' : 'lax',
       secure: config.isProduction,
       maxAge: 12 * 60 * 60 // 12 hours
     });
@@ -95,7 +95,12 @@ export default async function authRoutes(fastify) {
         // If already revoked or expired, proceed to clear cookie
       }
     }
-    reply.clearCookie('session_token', { path: '/' });
+    reply.clearCookie('session_token', {
+      path: '/',
+      httpOnly: true,
+      sameSite: config.isProduction ? 'none' : 'lax',
+      secure: config.isProduction
+    });
     return { success: true };
   });
 

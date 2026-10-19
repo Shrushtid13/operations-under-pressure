@@ -30,8 +30,16 @@ export function useWebSocket(isAuthenticated, onAuthFailed) {
     function connect() {
       if (isUnmounted) return;
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      const apiBase = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+      let wsUrl;
+      if (apiBase) {
+        const wsProtocol = apiBase.startsWith('https') ? 'wss:' : 'ws:';
+        const hostPath = apiBase.replace(/^https?:\/\//, '');
+        wsUrl = `${wsProtocol}//${hostPath}/ws`;
+      } else {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsUrl = `${protocol}//${window.location.host}/ws`;
+      }
 
       try {
         ws = new WebSocket(wsUrl);

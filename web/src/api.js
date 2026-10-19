@@ -17,6 +17,8 @@ export class ApiError extends Error {
  * - Content-Type: 'application/json' on mutating requests
  * - Idempotency-Key support: callers can pass their own managed key; if not provided, generated per intent.
  */
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+
 export async function fetchApi(path, options = {}) {
   const method = (options.method || 'GET').toUpperCase();
   const headers = {
@@ -39,7 +41,11 @@ export async function fetchApi(path, options = {}) {
       ? (typeof options.body === 'string' ? options.body : JSON.stringify(options.body))
       : (isMutating ? '{}' : undefined);
 
-    res = await fetch(path, {
+    const fullUrl = path.startsWith('http://') || path.startsWith('https://')
+      ? path
+      : `${API_BASE_URL}${path}`;
+
+    res = await fetch(fullUrl, {
       method,
       headers,
       credentials: 'include',
