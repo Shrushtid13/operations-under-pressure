@@ -15,20 +15,78 @@ export async function hashPassword(plainText) {
   return argon2.hash(plainText, OWASP_ARGON2_OPTIONS);
 }
 
-export async function seedDatabase(options = { bulk: false }) {
+export async function seedDatabase(options = { bulk: false }, attempts = 3) {
   if (config.isProduction) {
     throw new Error('Refusing to seed database when NODE_ENV is production');
   }
 
   logger.info('Seeding database...');
   const client = await migratorPool.connect();
+  let released = false;
 
   try {
     await client.query('BEGIN');
 
+    // Backup non-test accounts and custom workspaces so human users are never wiped by seed/tests
+    let customUsers = [];
+    let customWorkspaces = [];
+    let customWsMemberships = [];
+    let customTeams = [];
+    let customTeamMemberships = [];
+
+    try {
+      const uRes = await client.query(`
+        SELECT * FROM users
+        WHERE email NOT LIKE '%@newtonite.test' AND email NOT LIKE '%@example.com'
+      `);
+      customUsers = uRes.rows;
+
+      if (customUsers.length > 0) {
+        const customUserIds = customUsers.map(u => u.id);
+        const wsRes = await client.query(`
+          SELECT * FROM workspaces 
+          WHERE id > 1 AND created_by = ANY($1::int[])
+        `, [customUserIds]);
+        customWorkspaces = wsRes.rows;
+        const customWsIds = customWorkspaces.map(w => w.id);
+
+        const wmRes = await client.query(`
+          SELECT * FROM workspace_memberships
+          WHERE user_id = ANY($1::int[])
+            AND (workspace_id = 1 OR workspace_id = ANY($2::int[]))
+        `, [customUserIds, customWsIds.length > 0 ? customWsIds : [-1]]);
+        customWsMemberships = wmRes.rows;
+
+        if (customWsIds.length > 0) {
+          const tmRes = await client.query(`
+            SELECT * FROM teams WHERE workspace_id = ANY($1::int[])
+          `, [customWsIds]);
+          customTeams = tmRes.rows;
+          const customTeamIds = customTeams.map(t => t.id);
+
+          if (customTeamIds.length > 0) {
+            const tmemRes = await client.query(`
+              SELECT * FROM team_memberships
+              WHERE user_id = ANY($1::int[]) AND team_id = ANY($2::int[])
+            `, [customUserIds, customTeamIds]);
+            customTeamMemberships = tmemRes.rows;
+          }
+        }
+      }
+    } catch {
+      // Tables might not exist on very first fresh run; safely ignore
+    }
+
     // Clean existing data for clean seed
     await client.query(`
       TRUNCATE TABLE 
+        workspace_invitations,
+        workspace_memberships,
+        work_item_assignees,
+        work_item_attachments,
+        operational_calls,
+        on_call_shifts,
+        team_messages,
         notifications,
         outbox,
         idempotency_keys,
@@ -37,6 +95,7 @@ export async function seedDatabase(options = { bulk: false }) {
         membership_events,
         team_memberships,
         teams,
+        workspaces,
         sessions,
         users
       RESTART IDENTITY CASCADE;
@@ -65,6 +124,33 @@ export async function seedDatabase(options = { bulk: false }) {
       userMap[u.email] = rows[0].id;
     }
 
+    // Seed default Newtonite Workspace
+    const { rows: wsRows } = await client.query(
+      `INSERT INTO workspaces (name, slug, created_by)
+       VALUES ('Newtonite Engineering', 'newtonite', $1)
+       RETURNING id`,
+      [userMap['alice@newtonite.test']]
+    );
+    const defaultWorkspaceId = wsRows[0].id;
+
+    for (const [email, uId] of Object.entries(userMap)) {
+      const wsRole = ['alice@newtonite.test', 'bob@newtonite.test'].includes(email) ? 'owner' : (email === 'admin@newtonite.test' ? 'admin' : 'member');
+      await client.query(
+        `INSERT INTO workspace_memberships (workspace_id, user_id, role)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+        [defaultWorkspaceId, uId, wsRole]
+      );
+    }
+
+    // Seed reusable demo invite code for workspace 1
+    await client.query(
+      `INSERT INTO workspace_invitations (workspace_id, team_id, code, role, expires_at)
+       VALUES ($1, NULL, 'DEMO-NEWTONITE', 'member', '2099-01-01')
+       ON CONFLICT (code) DO NOTHING`,
+      [defaultWorkspaceId]
+    );
+
     // 2. Seed Teams (Each team key matches candidate brief categories)
     const teamsData = [
       { name: 'Operations & Incidents', key: 'OPS' },
@@ -75,10 +161,10 @@ export async function seedDatabase(options = { bulk: false }) {
     const teamMap = {};
     for (const t of teamsData) {
       const { rows } = await client.query(
-        `INSERT INTO teams (name, key)
-         VALUES ($1, $2)
+        `INSERT INTO teams (name, key, workspace_id)
+         VALUES ($1, $2, $3)
          RETURNING id, key`,
-        [t.name, t.key]
+        [t.name, t.key, defaultWorkspaceId]
       );
       teamMap[t.key] = rows[0].id;
     }
@@ -109,9 +195,10 @@ export async function seedDatabase(options = { bulk: false }) {
       );
     }
 
-    // 4. Seed initial realistic work items reflecting the candidate brief:
-    // (Customer issue, incident, payment, compliance, task requiring approval)
+    // 4. Seed rich, realistic work items reflecting all operational workflow states:
+    // (open, in_progress, pending_approval, resolved, closed across OPS, PAY, ENG)
     const initialItems = [
+      // === OPS Team ===
       {
         teamKey: 'OPS',
         kind: 'incident',
@@ -120,14 +207,36 @@ export async function seedDatabase(options = { bulk: false }) {
         status: 'in_progress',
         priority: 4,
         assigneeEmail: 'charlie@newtonite.test',
+        requiresApproval: true,
+        dueDays: 1
+      },
+      {
+        teamKey: 'OPS',
+        kind: 'incident',
+        title: 'Cluster ingress controller latency degradation across eu-west-1',
+        description: 'Ingress controller pod restart loop causing 502 bad gateway errors on edge routes. Needs immediate claim.',
+        status: 'open',
+        priority: 4,
+        assigneeEmail: null,
         requiresApproval: false,
         dueDays: 1
       },
       {
-        teamKey: 'PAY',
-        kind: 'payment',
-        title: 'Unreconciled merchant payout batch #8912',
-        description: 'Discrepancy of €14,250 between bank gateway and ledger. Payout is currently held pending sign-off.',
+        teamKey: 'OPS',
+        kind: 'incident',
+        title: 'Database connection pool exhaustion during peak flash sale',
+        description: 'Pool saturation reached 98% with 42 clients waiting on checkout service. Scale pool size and add read replica.',
+        status: 'in_progress',
+        priority: 4,
+        assigneeEmail: 'alice@newtonite.test',
+        requiresApproval: true,
+        dueDays: 2
+      },
+      {
+        teamKey: 'OPS',
+        kind: 'customer_issue',
+        title: 'Enterprise customer Acme Corp unable to export audit logs',
+        description: 'Export job terminates with 504 gateway timeout for date ranges exceeding 30 days. Fix pagination memory buffer.',
         status: 'pending_approval',
         priority: 3,
         assigneeEmail: 'charlie@newtonite.test',
@@ -137,9 +246,9 @@ export async function seedDatabase(options = { bulk: false }) {
       },
       {
         teamKey: 'OPS',
-        kind: 'customer_issue',
-        title: 'Enterprise customer Acme Corp unable to export audit logs',
-        description: 'Export job terminates with 504 gateway timeout for date ranges exceeding 30 days.',
+        kind: 'task',
+        title: 'Worker node pool CPU throttling under spike traffic',
+        description: 'Node group 2 hitting CFS quota limits during morning ingest batches. Adjust burst allocations.',
         status: 'open',
         priority: 2,
         assigneeEmail: null,
@@ -147,15 +256,85 @@ export async function seedDatabase(options = { bulk: false }) {
         dueDays: 5
       },
       {
-        teamKey: 'ENG',
-        kind: 'compliance',
-        title: 'Q3 GDPR right-to-erasure batch execution',
-        description: 'Verify anonymization of cold storage archives before final purge confirmation.',
-        status: 'in_progress',
-        priority: 3,
+        teamKey: 'OPS',
+        kind: 'task',
+        title: 'Log aggregator elasticsearch buffer high watermark',
+        description: 'Buffer reached 85% capacity after weekend debug logging. Cleaned old indices and rotated snapshot.',
+        status: 'resolved',
+        priority: 2,
+        assigneeEmail: 'alice@newtonite.test',
+        requiresApproval: false,
+        dueDays: 7
+      },
+      {
+        teamKey: 'OPS',
+        kind: 'task',
+        title: 'Routine quarterly SSL certificate rotation for internal gateway',
+        description: 'Completed automated LetsEncrypt wildcard renewal and verified cipher suites.',
+        status: 'closed',
+        priority: 1,
+        assigneeEmail: 'bob@newtonite.test',
+        requiresApproval: false,
+        dueDays: -10
+      },
+
+      // === PAY Team ===
+      {
+        teamKey: 'PAY',
+        kind: 'payment',
+        title: 'Unreconciled merchant payout batch #8912',
+        description: 'Discrepancy of €14,250 between bank gateway and ledger. Payout is currently held pending sign-off.',
+        status: 'pending_approval',
+        priority: 4,
+        assigneeEmail: 'charlie@newtonite.test',
+        requiresApproval: true,
+        approvalRequestedByEmail: 'charlie@newtonite.test',
+        dueDays: 2
+      },
+      {
+        teamKey: 'PAY',
+        kind: 'payment',
+        title: 'Stripe webhook retry queue saturation on recurring billing',
+        description: 'Outbound webhook queue backed up by 12,000 events due to endpoint 429 throttling. Triage needed.',
+        status: 'open',
+        priority: 4,
+        assigneeEmail: null,
+        requiresApproval: false,
+        dueDays: 1
+      },
+      {
+        teamKey: 'PAY',
+        kind: 'payment',
+        title: 'Manual wire transfer authorization for enterprise vendor ($250k)',
+        description: 'Compliance checks passed. High-value wire transfer pending dual-lead verification.',
+        status: 'pending_approval',
+        priority: 4,
         assigneeEmail: 'bob@newtonite.test',
         requiresApproval: true,
-        dueDays: -1 // Overdue for testing needs_attention!
+        approvalRequestedByEmail: 'bob@newtonite.test',
+        dueDays: 1
+      },
+      {
+        teamKey: 'PAY',
+        kind: 'payment',
+        title: 'Chargeback dispute processing pipeline stalls',
+        description: 'Automated dispute evidence aggregation worker halted on corrupted PDF payload. Charlie investigating.',
+        status: 'in_progress',
+        priority: 3,
+        assigneeEmail: 'charlie@newtonite.test',
+        requiresApproval: true,
+        dueDays: 3
+      },
+      {
+        teamKey: 'PAY',
+        kind: 'payment',
+        title: 'SEPA direct debit mandate signature validation failure',
+        description: 'XML parser rejecting German IBAN formatting with spaces. Open for engineer claim.',
+        status: 'open',
+        priority: 2,
+        assigneeEmail: null,
+        requiresApproval: false,
+        dueDays: 4
       },
       {
         teamKey: 'PAY',
@@ -167,6 +346,53 @@ export async function seedDatabase(options = { bulk: false }) {
         assigneeEmail: 'alice@newtonite.test',
         requiresApproval: false,
         dueDays: 7
+      },
+
+      // === ENG Team ===
+      {
+        teamKey: 'ENG',
+        kind: 'compliance',
+        title: 'Q3 GDPR right-to-erasure batch execution',
+        description: 'Verify anonymization of cold storage archives before final purge confirmation. Bob working on verification.',
+        status: 'in_progress',
+        priority: 3,
+        assigneeEmail: 'bob@newtonite.test',
+        requiresApproval: true,
+        dueDays: -1 // Overdue for testing needs_attention!
+      },
+      {
+        teamKey: 'ENG',
+        kind: 'incident',
+        title: 'Kubernetes container memory limits triggering OOM kills in worker pod 3',
+        description: 'Memory ceiling exceeded during image thumbnailing pipeline. Open for claim and resource limit bump.',
+        status: 'open',
+        priority: 3,
+        assigneeEmail: null,
+        requiresApproval: false,
+        dueDays: 2
+      },
+      {
+        teamKey: 'ENG',
+        kind: 'task',
+        title: 'Production firewall rule change for cloud egress proxy',
+        description: 'Outbound CIDR expansion for AWS GovCloud region sync. Awaiting lead signoff.',
+        status: 'pending_approval',
+        priority: 3,
+        assigneeEmail: 'charlie@newtonite.test',
+        requiresApproval: true,
+        approvalRequestedByEmail: 'charlie@newtonite.test',
+        dueDays: 1
+      },
+      {
+        teamKey: 'ENG',
+        kind: 'task',
+        title: 'Deprecate legacy v1 metrics ingestion endpoint',
+        description: 'Decommissioned v1 endpoint after ensuring zero active callers over 14-day telemetry window.',
+        status: 'closed',
+        priority: 1,
+        assigneeEmail: 'bob@newtonite.test',
+        requiresApproval: false,
+        dueDays: -14
       }
     ];
 
@@ -204,6 +430,15 @@ export async function seedDatabase(options = { bulk: false }) {
 
       const itemId = itemRows[0].id;
 
+      if (assigneeId) {
+        await client.query(
+          `INSERT INTO work_item_assignees (work_item_id, user_id, assigned_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT DO NOTHING`,
+          [itemId, assigneeId]
+        );
+      }
+
       // Create initial 'created' event (seq=1, item_version=1)
       const { rows: eventRows } = await client.query(
         `INSERT INTO work_item_events (
@@ -218,6 +453,48 @@ export async function seedDatabase(options = { bulk: false }) {
          VALUES ($1, 'work_item.created', $2, 'pending')`,
         [eventRows[0].id, JSON.stringify({ work_item_id: itemId, team_id: teamId })]
       );
+    }
+
+    // 5. Seed initial team messages for real-time chat
+    const opsTeamId = teamMap['OPS'];
+    const secTeamId = teamMap['SEC'];
+    const payTeamId = teamMap['PAY'];
+
+    const initialMessages = [
+      {
+        teamId: opsTeamId,
+        senderId: userMap['alice@newtonite.test'],
+        content: '👋 Welcome to the Operations Core channel. Shift handoff: all critical alerts are triaged.'
+      },
+      {
+        teamId: opsTeamId,
+        senderId: userMap['charlie@newtonite.test'],
+        content: 'Acknowledged Alice! I am monitoring the database connection pool latency.'
+      },
+      {
+        teamId: opsTeamId,
+        senderId: userMap['alice@newtonite.test'],
+        content: 'Great, ping here if any threshold breaches occur so we can coordinate.'
+      },
+      {
+        teamId: payTeamId,
+        senderId: userMap['bob@newtonite.test'],
+        content: 'Payments channel active: settlement batch #4402 completed with 100% success rate.'
+      },
+      {
+        teamId: secTeamId,
+        senderId: userMap['alice@newtonite.test'],
+        content: 'Security team: quarterly access audit reviews underway. Leads please review rosters.'
+      }
+    ];
+
+    for (const msg of initialMessages) {
+      if (msg.teamId && msg.senderId) {
+        await client.query(
+          `INSERT INTO team_messages (team_id, sender_id, content) VALUES ($1, $2, $3)`,
+          [msg.teamId, msg.senderId, msg.content]
+        );
+      }
     }
 
     // Optional bulk data generation using generate_series (if --bulk flag passed)
@@ -272,14 +549,134 @@ export async function seedDatabase(options = { bulk: false }) {
       await client.query(`UPDATE teams SET next_item_number = 5200 WHERE id = ${opsTeamId};`);
     }
 
+    // 6. Seed sample work item attachments
+    await client.query(`
+      INSERT INTO work_item_attachments (work_item_id, uploader_id, filename, file_type, file_size, description)
+      VALUES
+        (1, 1, 'EU-Merchant-Gateway-Diagnostic-Report.pdf', 'application/pdf', 245760, 'Full error traces and gateway timeout metrics from EU edge proxies'),
+        (1, 2, 'Payment-Gateway-Failover-SOP-v3.pdf', 'application/pdf', 184320, 'Standard Operating Procedure for routing failover across secondary payment providers'),
+        (2, 3, 'Incident-Post-Mortem-PAY-49.pdf', 'application/pdf', 312500, 'Detailed root-cause analysis of settlement pipeline deadlock');
+    `);
+
+    // 7. Seed On-Call shifts for all teams
+    await client.query(`
+      INSERT INTO on_call_shifts (team_id, user_id, tier, starts_at, ends_at)
+      VALUES
+        (1, 1, 'primary', now() - interval '2 days', now() + interval '5 days'),
+        (1, 2, 'secondary', now() - interval '2 days', now() + interval '5 days'),
+        (1, 3, 'escalation', now() - interval '2 days', now() + interval '5 days'),
+        (2, 2, 'primary', now() - interval '1 day', now() + interval '6 days'),
+        (2, 1, 'secondary', now() - interval '1 day', now() + interval '6 days'),
+        (3, 3, 'primary', now() - interval '3 days', now() + interval '4 days'),
+        (3, 1, 'secondary', now() - interval '3 days', now() + interval '4 days');
+    `);
+
+    // 8. Seed active Operational Calls & War Rooms
+    await client.query(`
+      INSERT INTO operational_calls (team_id, creator_id, title, description, platform, meeting_url, scheduled_at, work_item_id, participants, status)
+      VALUES
+        (
+          1,
+          1,
+          'Urgent War Room: EU Card Payment Failures',
+          'Live triage and emergency mitigation of European payment gateway timeout rates exceeding 35%.',
+          'google_meet',
+          'https://meet.google.com/huv-wkqz-kpm',
+          now() - interval '10 minutes',
+          1,
+          '[1, 2, 3]'::jsonb,
+          'active'
+        ),
+        (
+          1,
+          2,
+          'Daily Operational Sync & Shift Handover',
+          'Review open incidents, overnight queue, and assign high-priority compliance jobs.',
+          'teams',
+          'https://teams.microsoft.com/l/meetup-join/operations-sync-daily-91823',
+          now() + interval '2 hours',
+          null,
+          '[1, 2, 3, 4]'::jsonb,
+          'active'
+        );
+    `);
+
+    // Restore preserved custom user accounts and their workspaces
+    if (customUsers.length > 0) {
+      for (const u of customUsers) {
+        await client.query(
+          `INSERT INTO users (id, email, name, password_hash, is_org_admin, failed_logins, created_at)
+           OVERRIDING SYSTEM VALUE
+           VALUES ($1, $2, $3, $4, $5, 0, $6)
+           ON CONFLICT (id) DO NOTHING`,
+          [u.id, u.email, u.name, u.password_hash, u.is_org_admin, u.created_at]
+        );
+      }
+      for (const ws of customWorkspaces) {
+        await client.query(
+          `INSERT INTO workspaces (id, name, slug, created_by, created_at)
+           OVERRIDING SYSTEM VALUE
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (id) DO NOTHING`,
+          [ws.id, ws.name, ws.slug, ws.created_by, ws.created_at]
+        );
+      }
+      for (const wm of customWsMemberships) {
+        await client.query(
+          `INSERT INTO workspace_memberships (workspace_id, user_id, role, created_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+          [wm.workspace_id, wm.user_id, wm.role, wm.created_at]
+        );
+      }
+      for (const t of customTeams) {
+        await client.query(
+          `INSERT INTO teams (id, name, key, workspace_id, next_item_number, created_at)
+           OVERRIDING SYSTEM VALUE
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (id) DO NOTHING`,
+          [t.id, t.name, t.key, t.workspace_id, t.next_item_number, t.created_at]
+        );
+      }
+      for (const tm of customTeamMemberships) {
+        await client.query(
+          `INSERT INTO team_memberships (team_id, user_id, role, created_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (team_id, user_id) DO NOTHING`,
+          [tm.team_id, tm.user_id, tm.role, tm.created_at]
+        );
+      }
+
+      // Synchronize identity sequences to highest IDs
+      await client.query(`SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(id) FROM users), 1))`);
+      await client.query(`SELECT setval(pg_get_serial_sequence('workspaces', 'id'), COALESCE((SELECT MAX(id) FROM workspaces), 1))`);
+      await client.query(`SELECT setval(pg_get_serial_sequence('teams', 'id'), COALESCE((SELECT MAX(id) FROM teams), 1))`);
+    }
+
     await client.query('COMMIT');
     logger.info('Seed completed successfully!');
   } catch (err) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore rollback errors if connection was severed
+    }
+    if (err.code === '40P01' && attempts > 1) {
+      logger.warn('Deadlock detected during seedDatabase, retrying in 250ms...');
+      if (!released) {
+        released = true;
+        client.release();
+      }
+      await new Promise((r) => setTimeout(r, 250));
+      return seedDatabase(options, attempts - 1);
+    }
     logger.error({ err }, 'Seed failed, rolled back');
     throw err;
   } finally {
-    client.release();
+    if (!released) {
+      released = true;
+      client.release();
+    }
   }
 }
 

@@ -43,17 +43,25 @@ export async function assertCan(user, action, workItem, options = {}, client = p
   const { rows } = await client.query(roleQuery, [user.id, teamId]);
   const userRole = rows.length > 0 ? rows[0].role : null;
 
-  // Non-members: check if org admin (read-only)
+  // Non-members: check if org admin within same workspace (read-only)
   if (!userRole) {
     if (user.is_org_admin) {
-      // Org admin has read-only access to all teams
-      if (['read', 'view_events', 'view_summary', 'view_members'].includes(action)) {
-        return { role: 'viewer', isOrgAdmin: true };
+      const { rows: wsRows } = await client.query(
+        `SELECT 1 FROM teams t
+         JOIN workspace_memberships wm ON wm.workspace_id = t.workspace_id
+         WHERE t.id = $1 AND wm.user_id = $2`,
+        [teamId, user.id]
+      );
+      if (wsRows.length > 0) {
+        // Org admin has read-only access to teams in their own workspace
+        if (['read', 'view_events', 'view_summary', 'view_members', 'view_messages'].includes(action)) {
+          return { role: 'viewer', isOrgAdmin: true };
+        }
+        // Org admin attempting write on non-member team gets 403
+        throw forbidden('Org admin has read-only access to teams they are not a member of');
       }
-      // Org admin attempting write on foreign team gets 403 (they know it exists)
-      throw forbidden('Org admin has read-only access to teams they are not a member of');
     }
-    // Regular non-member gets 404 to avoid leaking existence
+    // Regular non-member or foreign team gets 404 to avoid leaking existence
     throw notFound();
   }
 
@@ -63,12 +71,14 @@ export async function assertCan(user, action, workItem, options = {}, client = p
     case 'read':
     case 'view_events':
     case 'view_members':
+    case 'view_messages':
       // Any active member (viewer+) can read
       return { role: userRole };
 
     case 'create':
     case 'claim':
     case 'comment':
+    case 'send_message':
       if (roleLevel < ROLE_HIERARCHY.member) {
         throw forbidden(`Action "${action}" requires member or lead role`);
       }
@@ -93,7 +103,14 @@ export async function assertCan(user, action, workItem, options = {}, client = p
       }
       // Priority check: changing priority requires lead role or being the current assignee
       if (options.touchingPriority) {
-        const isAssignee = workItem.assignee_id && String(workItem.assignee_id) === String(user.id);
+        let isAssignee = workItem.assignee_id && String(workItem.assignee_id) === String(user.id);
+        if (!isAssignee && workItem.id) {
+          const { rows: aRows } = await client.query(
+            `SELECT 1 FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+            [workItem.id, user.id]
+          );
+          isAssignee = aRows.length > 0;
+        }
         const isLead = roleLevel >= ROLE_HIERARCHY.lead;
         if (!isLead && !isAssignee) {
           throw forbidden('Changing priority requires team lead role or being the current assignee');
@@ -101,10 +118,44 @@ export async function assertCan(user, action, workItem, options = {}, client = p
       }
       return { role: userRole };
 
-    case 'request_approval':
+    case 'request_approval': {
       // Current assignee initiates approval
-      if (String(workItem.assignee_id) !== String(user.id)) {
-        throw forbidden('Only the current assignee can request approval');
+      let isAssignee = workItem.assignee_id && String(workItem.assignee_id) === String(user.id);
+      if (!isAssignee && workItem.id) {
+        const { rows: aRows } = await client.query(
+          `SELECT 1 FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+          [workItem.id, user.id]
+        );
+        isAssignee = aRows.length > 0;
+      }
+      if (!isAssignee) {
+        throw forbidden('Only an assignee working on this item can request approval');
+      }
+      return { role: userRole };
+    }
+
+    case 'resolve': {
+      if (roleLevel < ROLE_HIERARCHY.member) {
+        throw forbidden('Viewers cannot resolve work items');
+      }
+      let isAssignee = workItem.assignee_id && String(workItem.assignee_id) === String(user.id);
+      if (!isAssignee && workItem.id) {
+        const { rows: aRows } = await client.query(
+          `SELECT 1 FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+          [workItem.id, user.id]
+        );
+        isAssignee = aRows.length > 0;
+      }
+      if (!isAssignee) {
+        throw forbidden('The resolved mark can only be done by the current assignee');
+      }
+      return { role: userRole };
+    }
+
+    case 'add_assignee':
+    case 'remove_assignee':
+      if (roleLevel < ROLE_HIERARCHY.member) {
+        throw forbidden('Viewers cannot manage assignees');
       }
       return { role: userRole };
 

@@ -14,7 +14,7 @@
     "migrate": "node src/db/migrator.js",
     "seed": "node src/db/seed.js",
     "backup": "node scripts/backup.js",
-    "test": "vitest run --testTimeout=30000",
+    "test": "vitest run --fileParallelism=false --testTimeout=30000",
     "test:concurrency": "vitest run test/concurrency.test.js --testTimeout=30000"
   },
   "dependencies": {

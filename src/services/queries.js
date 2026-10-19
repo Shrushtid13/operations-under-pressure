@@ -2,16 +2,21 @@
 import { pool } from '../db/pool.js';
 import { assertCan } from './policy.js';
 import { notFound, validationError } from '../shared/errors.js';
+import { processDeadlineReminders } from './reminderService.js';
 
 /**
  * Build membership scope subquery for list authorization
  */
 function membershipScope(user) {
   if (user.is_org_admin) {
-    return { clause: '', params: [], nextIdx: 1 };
+    return {
+      clause: `w.team_id IN (SELECT t.id FROM teams t JOIN workspace_memberships wm ON wm.workspace_id = t.workspace_id WHERE wm.user_id = $1)`,
+      params: [user.id],
+      nextIdx: 2
+    };
   }
   return {
-    clause: `AND w.team_id IN (SELECT team_id FROM team_memberships WHERE user_id = $1 AND removed_at IS NULL)`,
+    clause: `w.team_id IN (SELECT team_id FROM team_memberships WHERE user_id = $1 AND removed_at IS NULL)`,
     params: [user.id],
     nextIdx: 2
   };
@@ -67,13 +72,15 @@ export async function listWorkItems(user, query) {
 
   // Assignee filter
   if (assignee === 'me') {
-    conditions.push(`w.assignee_id = $${idx++}`);
+    conditions.push(`(w.assignee_id = $${idx} OR EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id AND wia.user_id = $${idx}))`);
     params.push(user.id);
+    idx++;
   } else if (assignee === 'none') {
-    conditions.push(`w.assignee_id IS NULL`);
+    conditions.push(`w.assignee_id IS NULL AND NOT EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id)`);
   } else if (assignee) {
-    conditions.push(`w.assignee_id = $${idx++}`);
+    conditions.push(`(w.assignee_id = $${idx} OR EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id AND wia.user_id = $${idx}))`);
     params.push(assignee);
+    idx++;
   }
 
   // Priority filter
@@ -90,10 +97,10 @@ export async function listWorkItems(user, query) {
   // needs_attention filter (§3: assigned-to-me not resolved/closed, or pending my approval, or unassigned priority >= 3, or overdue, or stale)
   if (needs_attention === 'true') {
     conditions.push(`(
-      (w.assignee_id = $${idx} AND w.status IN ('in_progress', 'pending_approval'))
-      OR (w.status = 'pending_approval' AND w.assignee_id IS NOT NULL AND w.approval_requested_by <> $${idx}
+      ((w.assignee_id = $${idx} OR EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id AND wia.user_id = $${idx})) AND w.status IN ('in_progress', 'pending_approval'))
+      OR (w.status = 'pending_approval' AND (w.assignee_id IS NOT NULL OR EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id)) AND (w.approval_requested_by IS NULL OR w.approval_requested_by <> $${idx})
           AND EXISTS (SELECT 1 FROM team_memberships tm WHERE tm.team_id = w.team_id AND tm.user_id = $${idx} AND tm.role = 'lead' AND tm.removed_at IS NULL))
-      OR (w.assignee_id IS NULL AND w.priority >= 3 AND w.status = 'open')
+      OR (w.assignee_id IS NULL AND NOT EXISTS (SELECT 1 FROM work_item_assignees wia WHERE wia.work_item_id = w.id) AND w.priority >= 3 AND w.status = 'open')
       OR (w.due_at IS NOT NULL AND w.due_at < now() AND w.status IN ('open', 'in_progress', 'pending_approval'))
       OR (w.last_activity_at < now() - interval '3 days' AND w.status IN ('open', 'in_progress', 'pending_approval'))
     )`);
@@ -139,12 +146,17 @@ export async function listWorkItems(user, query) {
   const sql = `
     SELECT w.*, t.key AS team_key, t.name AS team_name,
            u_assignee.name AS assignee_name,
-           u_creator.name AS created_by_name
+           u_creator.name AS created_by_name,
+           u_approval.name AS approval_requested_by_name,
+           u_fix_approver.name AS fix_approved_by_name,
+           coalesce((SELECT json_agg(json_build_object('id', u.id, 'name', u.name, 'email', u.email, 'assigned_at', wia.assigned_at)) FROM work_item_assignees wia JOIN users u ON u.id = wia.user_id WHERE wia.work_item_id = w.id), '[]'::json) AS assignees
     FROM work_items w
     JOIN teams t ON t.id = w.team_id
     LEFT JOIN users u_assignee ON u_assignee.id = w.assignee_id
     LEFT JOIN users u_creator ON u_creator.id = w.created_by
-    WHERE ${conditions.join(' ')} ${cursorCondition}
+    LEFT JOIN users u_approval ON u_approval.id = w.approval_requested_by
+    LEFT JOIN users u_fix_approver ON u_fix_approver.id = w.fix_approved_by
+    WHERE ${conditions.join(' AND ')} ${cursorCondition}
     ORDER BY ${orderBy}
     LIMIT $${idx++}
   `;
@@ -189,13 +201,16 @@ export async function getWorkItemDetail(user, itemId) {
             u_assignee.name AS assignee_name, u_assignee.email AS assignee_email,
             u_creator.name AS created_by_name,
             u_requester.name AS requested_by_name,
-            u_approval.name AS approval_requested_by_name
+            u_approval.name AS approval_requested_by_name,
+            u_fix_approver.name AS fix_approved_by_name,
+            coalesce((SELECT json_agg(json_build_object('id', u.id, 'name', u.name, 'email', u.email, 'assigned_at', wia.assigned_at)) FROM work_item_assignees wia JOIN users u ON u.id = wia.user_id WHERE wia.work_item_id = w.id), '[]'::json) AS assignees
      FROM work_items w
      JOIN teams t ON t.id = w.team_id
      LEFT JOIN users u_assignee ON u_assignee.id = w.assignee_id
      LEFT JOIN users u_creator ON u_creator.id = w.created_by
      LEFT JOIN users u_requester ON u_requester.id = w.requested_by
      LEFT JOIN users u_approval ON u_approval.id = w.approval_requested_by
+     LEFT JOIN users u_fix_approver ON u_fix_approver.id = w.fix_approved_by
      WHERE w.id = $1`,
     [itemId]
   );
@@ -213,26 +228,65 @@ export async function getWorkItemDetail(user, itemId) {
   const isOverdue = item.due_at && new Date(item.due_at) < new Date() &&
     ['open', 'in_progress', 'pending_approval'].includes(item.status);
 
+  // Fetch attachments
+  const { rows: attachmentRows } = await pool.query(
+    `SELECT a.id, a.work_item_id, a.uploader_id, a.filename, a.file_type, a.file_size, a.file_data, a.description, a.created_at,
+            u.name AS uploader_name
+     FROM work_item_attachments a
+     JOIN users u ON u.id = a.uploader_id
+     WHERE a.work_item_id = $1
+     ORDER BY a.created_at ASC`,
+    [itemId]
+  );
+
+  // Fetch latest approval request notes if present
+  let approvalRequest = null;
+  const { rows: appRows } = await pool.query(
+    `SELECT e.id, e.actor_id, e.payload, e.created_at, u.name AS actor_name
+     FROM work_item_events e
+     JOIN users u ON u.id = e.actor_id
+     WHERE e.work_item_id = $1 AND e.type = 'approval_requested'
+     ORDER BY e.seq DESC
+     LIMIT 1`,
+    [itemId]
+  );
+  if (appRows.length > 0) {
+    const p = typeof appRows[0].payload === 'string' ? JSON.parse(appRows[0].payload) : (appRows[0].payload || {});
+    approvalRequest = {
+      id: appRows[0].id,
+      actor_id: appRows[0].actor_id,
+      actor_name: appRows[0].actor_name,
+      notes: p?.reason || p?.notes || null,
+      created_at: appRows[0].created_at
+    };
+  }
+
   return {
     ...item,
     item_key: `${item.team_key}-${item.number}`,
     next_action: nextAction,
-    is_overdue: isOverdue
+    is_overdue: isOverdue,
+    attachments: attachmentRows,
+    approval_request: approvalRequest
   };
 }
 
 function deriveNextAction(user, item) {
   switch (item.status) {
     case 'open':
-      return 'Unassigned — needs an owner';
+      return 'Unassigned — awaiting team lead to assign an owner';
     case 'in_progress':
-      if (item.requires_approval) return 'In progress — will need approval before resolving';
-      return 'In progress';
+      if (item.requires_approval) {
+        return 'Work in progress — complete fix, then submit resolution for lead sign-off to resolve';
+      }
+      return 'Work in progress — investigate and apply fix, then mark as resolved';
     case 'pending_approval':
-      if (String(item.approval_requested_by) === String(user.id)) return 'You requested approval — awaiting lead review';
-      return 'Awaiting approval from a lead';
+      if (String(item.approval_requested_by) === String(user.id)) {
+        return 'Fix submitted by you — awaiting lead review and sign-off to resolve';
+      }
+      return 'Fix submitted for review — awaiting lead approval and sign-off to resolve';
     case 'resolved':
-      return 'Resolved — can be closed or reopened';
+      return 'Incident resolved — lead can close or reopen if necessary';
     case 'closed':
       return 'Closed (terminal)';
     default:
@@ -302,8 +356,8 @@ export async function getOverviewSummary(user) {
   let params;
 
   if (user.is_org_admin) {
-    teamFilter = '1=1';
-    params = [];
+    teamFilter = `t.workspace_id IN (SELECT workspace_id FROM workspace_memberships WHERE user_id = $1)`;
+    params = [user.id];
   } else {
     teamFilter = `t.id IN (SELECT team_id FROM team_memberships WHERE user_id = $1 AND removed_at IS NULL)`;
     params = [user.id];
@@ -355,6 +409,9 @@ export async function listTeamMembers(user, teamId) {
  * GET /notifications - Inbox (keyset paginated, newest first)
  */
 export async function listNotifications(user, query) {
+  // Synchronize approaching or overdue deadline reminders so inbox is real-time accurate
+  await processDeadlineReminders(pool);
+
   const { cursor, limit = 50 } = query;
   const pageLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
 
@@ -372,15 +429,40 @@ export async function listNotifications(user, query) {
   // Join on current membership (or org admin) so lost team access hides notifications
   const membershipJoin = user.is_org_admin
     ? ''
-    : `JOIN team_memberships tm ON tm.team_id = w.team_id AND tm.user_id = $1 AND tm.removed_at IS NULL`;
+    : `JOIN team_memberships tm ON tm.team_id = COALESCE(w.team_id, n.team_id, c.team_id) AND tm.user_id = $1 AND tm.removed_at IS NULL`;
 
   const sql = `
-    SELECT n.*, w.title AS item_title, t.key AS team_key, w.number AS item_number,
-           u_actor.name AS actor_name, e.type AS event_type
+    SELECT n.*,
+           w.title AS item_title,
+           COALESCE(t.key, t_direct.key, t_call.key) AS team_key,
+           w.number AS item_number,
+           COALESCE(u_actor.name, u_sender.name, u_caller.name, CASE WHEN n.kind IN ('deadline_approaching', 'deadline_overdue') THEN 'Deadline Reminder' ELSE 'System' END) AS actor_name,
+           COALESCE(
+             e.type,
+             CASE
+               WHEN n.kind IN ('deadline_approaching', 'deadline_overdue') THEN n.kind
+               WHEN n.call_id IS NOT NULL THEN 'call_invite'
+               WHEN n.message_id IS NOT NULL THEN 'team_message'
+               ELSE n.kind
+             END
+           ) AS event_type,
+           m.content AS message_content,
+           c.title AS call_title,
+           c.meeting_url AS call_meeting_url,
+           c.platform AS call_platform,
+           w.due_at AS item_due_at,
+           w.priority AS item_priority,
+           w.status AS item_status
     FROM notifications n
-    JOIN work_item_events e ON e.id = n.event_id
-    JOIN work_items w ON w.id = n.work_item_id
-    JOIN teams t ON t.id = w.team_id
+    LEFT JOIN work_item_events e ON e.id = n.event_id
+    LEFT JOIN work_items w ON w.id = n.work_item_id
+    LEFT JOIN teams t ON t.id = w.team_id
+    LEFT JOIN teams t_direct ON t_direct.id = n.team_id
+    LEFT JOIN team_messages m ON m.id = n.message_id
+    LEFT JOIN users u_sender ON u_sender.id = m.sender_id
+    LEFT JOIN operational_calls c ON c.id = n.call_id
+    LEFT JOIN teams t_call ON t_call.id = c.team_id
+    LEFT JOIN users u_caller ON u_caller.id = c.creator_id
     ${membershipJoin}
     LEFT JOIN users u_actor ON u_actor.id = e.actor_id
     WHERE n.user_id = $1 ${cursorCondition}

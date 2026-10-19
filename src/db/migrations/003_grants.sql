@@ -6,7 +6,7 @@ GRANT USAGE ON SCHEMA public TO app_runtime;
 GRANT USAGE ON SCHEMA public TO app_backup;
 
 -- users table
-GRANT SELECT ON users TO app_runtime;
+GRANT SELECT, INSERT ON users TO app_runtime;
 GRANT UPDATE (password_hash, failed_logins, last_failed_login_at, locked_until) ON users TO app_runtime;
 
 -- sessions table
@@ -14,8 +14,7 @@ GRANT SELECT, INSERT, DELETE ON sessions TO app_runtime;
 GRANT UPDATE (last_seen_at, revoked_at) ON sessions TO app_runtime;
 
 -- teams table
-GRANT SELECT ON teams TO app_runtime;
-GRANT UPDATE (next_item_number) ON teams TO app_runtime;
+GRANT SELECT, INSERT, UPDATE ON teams TO app_runtime;
 
 -- team_memberships table (no DELETE)
 GRANT SELECT, INSERT ON team_memberships TO app_runtime;

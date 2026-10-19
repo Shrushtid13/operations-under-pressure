@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { workerPool, withTransaction } from '../db/pool.js';
 import { config } from '../shared/config.js';
 import { logger } from '../shared/logger.js';
+import { processDeadlineReminders } from '../services/reminderService.js';
 
 let isRunning = true;
 
@@ -23,6 +24,15 @@ async function resolveRecipients(client, eventId, eventType, workItemId, teamId,
     const item = itemRows[0];
     if (item.created_by) recipients.add(String(item.created_by));
     if (item.assignee_id) recipients.add(String(item.assignee_id));
+  }
+
+  // Load all co-assignees from work_item_assignees
+  const { rows: assigneeRows } = await client.query(
+    `SELECT user_id FROM work_item_assignees WHERE work_item_id = $1`,
+    [workItemId]
+  );
+  for (const a of assigneeRows) {
+    recipients.add(String(a.user_id));
   }
 
   // Load previous assignee or other actors from event payload if available
@@ -228,12 +238,19 @@ export async function startWorker() {
 
   let lastReaper = Date.now();
   let lastCleanup = Date.now();
+  let lastDeadlines = 0;
 
   while (isRunning) {
     try {
       const processedCount = await processBatch();
 
       const now = Date.now();
+      // Run deadline reminder checks every 20 seconds
+      if (now - lastDeadlines > 20000) {
+        await processDeadlineReminders(workerPool);
+        lastDeadlines = now;
+      }
+
       // Run reaper every 60 seconds
       if (now - lastReaper > 60000) {
         await runReaper();

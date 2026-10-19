@@ -1,195 +1,170 @@
 // web/src/components/Sidebar.jsx
 import React from 'react';
 import {
-  Activity,
-  AlertTriangle,
-  Bot,
-  ChevronDown,
-  Layers,
+  Building2,
+  Inbox,
   LayoutDashboard,
+  ListOrdered,
   LogOut,
-  Radio,
-  Settings,
+  MessagesSquare,
+  PhoneCall,
+  Plus,
   Shield,
-  ShieldAlert,
+  UserCheck,
   Users
 } from 'lucide-react';
 
 export function Sidebar({
   user,
-  teams,
-  selectedTeamId,
-  onSelectTeam,
-  activeNav,
-  onSelectNav,
-  onOpenMembersModal,
+  currentHash,
+  onNavigate,
+  unreadCount = 0,
   onLogout,
-  isWsConnected
+  isMobileOpen,
+  onCloseMobile
 }) {
-  const currentTeam = teams?.find((t) => String(t.id) === String(selectedTeamId)) || teams?.[0];
-  const userRole = currentTeam?.role || (user?.is_org_admin ? 'org_admin' : 'viewer');
-  const isLeadOrAdmin = userRole === 'lead' || user?.is_org_admin;
+  const teams = user?.teams || [];
+  const currentWorkspaceName = user?.workspaces?.[0]?.name || teams[0]?.workspace_name || 'Newtonite Engineering';
+  const primaryRole = user?.is_org_admin ? 'Org admin' : (teams[0]?.role ? teams[0].role.charAt(0).toUpperCase() + teams[0].role.slice(1) : 'Member');
+  const userInitials = user?.name
+    ? user.name.split(' ').map((n) => n[0]).join('').slice(0, 2).toUpperCase()
+    : 'U';
+
+  const navItems = [
+    { id: 'overview', hash: '#/overview', label: 'Overview', icon: LayoutDashboard },
+    { id: 'my-work', hash: '#/my-work', label: 'My work', icon: UserCheck },
+    { id: 'all-work', hash: '#/all-work', label: 'All work', icon: ListOrdered },
+    { id: 'on-call', hash: '#/on-call', label: "Who's on call", icon: PhoneCall },
+    { id: 'chat', hash: '#/chat', label: 'Team chat', icon: MessagesSquare },
+    { id: 'team', hash: '#/team', label: 'Team members', icon: Users },
+    { id: 'inbox', hash: '#/inbox', label: 'Inbox', icon: Inbox, badge: unreadCount > 0 ? unreadCount : null }
+  ];
+
+  const content = (
+    <div className="flex flex-col justify-between h-full bg-[#0f1f2e] text-slate-300 w-[260px] select-none">
+      {/* Top Header & Brand */}
+      <div>
+        <div className="p-5 border-b border-slate-800/90 space-y-4">
+          {/* Workspace Title: Big, Bold, Natural */}
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 rounded-2xl bg-[#2f5bea] text-white flex items-center justify-center font-bold text-lg shadow-sm shrink-0">
+              {currentWorkspaceName.charAt(0).toUpperCase()}
+            </div>
+            <div className="min-w-0 flex-1">
+              <h1 className="text-lg font-bold text-white tracking-tight leading-tight truncate" title={currentWorkspaceName}>
+                {currentWorkspaceName}
+              </h1>
+              <p className="text-xs text-slate-400 truncate mt-0.5 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+                <span>{primaryRole}</span>
+                <span>·</span>
+                <span>{teams.length} {teams.length === 1 ? 'team' : 'teams'}</span>
+              </p>
+            </div>
+          </div>
+
+          {/* Workspace Action Button: Styled like the New Work Item button (bold, natural, cobalt) */}
+          <button
+            onClick={() => {
+              onNavigate('#/onboarding');
+              if (onCloseMobile) onCloseMobile();
+            }}
+            className="w-full py-2.5 px-4 bg-[#2f5bea] hover:bg-[#264ecc] text-white text-xs font-semibold rounded-xl flex items-center justify-center space-x-2 transition shadow-xs cursor-pointer active:scale-[0.98]"
+            title="Create new workspace or switch"
+          >
+            <Plus className="w-4 h-4 text-white" />
+            <span>New workspace</span>
+          </button>
+        </div>
+
+        {/* Navigation list */}
+        <nav className="p-4 space-y-1.5 mt-2 text-[15.5px]">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const isActive = currentHash.startsWith(item.hash) || (item.id === 'all-work' && currentHash.startsWith('#/work/'));
+            return (
+              <button
+                key={item.id}
+                onClick={() => {
+                  onNavigate(item.hash);
+                  if (onCloseMobile) onCloseMobile();
+                }}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl font-medium transition cursor-pointer text-left ${
+                  isActive
+                    ? 'bg-[#1e2e3d] text-white shadow-xs font-semibold'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-[#162635]'
+                }`}
+              >
+                <div className="flex items-center space-x-3.5 min-w-0">
+                  <Icon className="w-5 h-5 shrink-0 text-slate-400" />
+                  <span className="truncate">{item.label}</span>
+                </div>
+                {item.badge && (
+                  <span className="ml-2 px-2.5 py-0.5 text-xs font-bold rounded-full bg-rose-600 text-white tabular-nums shadow-xs">
+                    {item.badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </nav>
+      </div>
+
+      {/* Bottom User Card */}
+      <div className="p-5 border-t border-slate-800/80 bg-[#0d1b28]">
+        <div className="flex items-center justify-between">
+          <button
+            onClick={() => {
+              onNavigate('#/account');
+              if (onCloseMobile) onCloseMobile();
+            }}
+            className="flex items-center space-x-3.5 min-w-0 text-left hover:opacity-90 transition cursor-pointer"
+            title="Account settings"
+          >
+            <div className="w-10 h-10 rounded-full bg-[#8c6d3f] text-white flex items-center justify-center font-bold text-sm shrink-0 shadow-xs">
+              {userInitials}
+            </div>
+            <div className="min-w-0">
+              <div className="font-bold text-white text-[15px] truncate leading-tight">
+                {user?.name || 'User'}
+              </div>
+              <div className="text-xs text-slate-400 truncate leading-tight mt-1">
+                {primaryRole}
+              </div>
+            </div>
+          </button>
+
+          <button
+            onClick={onLogout}
+            title="Sign out"
+            className="p-2.5 text-slate-400 hover:text-rose-400 transition cursor-pointer rounded-xl hover:bg-slate-800"
+          >
+            <LogOut className="w-4.5 h-4.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
-    <aside className="w-60 bg-[#0d111c] border-r border-[#1a2234] flex flex-col justify-between shrink-0 select-none h-screen sticky top-0 text-slate-300">
-      {/* Top Branding & Nav List */}
-      <div className="flex flex-col overflow-y-auto">
-        {/* Brand Header: SwarmOps with logo icon */}
-        <div className="h-16 px-5 border-b border-[#1a2234] flex items-center justify-between">
-          <div className="flex items-center space-x-2.5">
-            <div className="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white text-xs shadow-md shadow-indigo-600/30">
-              <Bot className="w-4 h-4" />
-            </div>
-            <span className="text-sm font-bold tracking-tight text-white">
-              SwarmOps
-            </span>
-          </div>
+    <>
+      {/* Desktop Persistent Sidebar */}
+      <aside className="hidden md:block w-[240px] h-screen sticky top-0 shrink-0 z-20">
+        {content}
+      </aside>
 
+      {/* Mobile Drawer (Collapse under 768px) */}
+      {isMobileOpen && (
+        <div className="md:hidden fixed inset-0 z-50 flex">
           <div
-            className="flex items-center space-x-1"
-            title={isWsConnected ? 'Connected to live event stream' : 'Operating in polling mode'}
-          >
-            <span className={`w-2 h-2 rounded-full ${isWsConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={onCloseMobile}
+          />
+          <div className="relative z-10">
+            {content}
           </div>
         </div>
-
-        {/* Team Selector Context */}
-        <div className="p-3 border-b border-[#1a2234] bg-[#090d16]/60">
-          <div className="relative">
-            <select
-              value={selectedTeamId || ''}
-              onChange={(e) => onSelectTeam(e.target.value)}
-              className="w-full bg-[#131929] hover:bg-[#182136] text-slate-200 text-xs font-medium rounded-lg px-3 py-2 border border-[#222e46] focus:outline-none focus:border-indigo-500 cursor-pointer appearance-none pr-8 transition"
-            >
-              {teams?.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.key} — {t.name}
-                </option>
-              ))}
-            </select>
-            <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-3 pointer-events-none" />
-          </div>
-        </div>
-
-        {/* Navigation Sections */}
-        <div className="p-3 space-y-5 text-xs">
-          {/* SECTION 1: OVERVIEW */}
-          <div className="space-y-1">
-            <div className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-              OVERVIEW
-            </div>
-
-            <button
-              onClick={() => onSelectNav('all')}
-              className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium transition cursor-pointer text-left ${
-                activeNav === 'all'
-                  ? 'bg-[#182136] text-white font-semibold'
-                  : 'text-slate-400 hover:bg-[#131929] hover:text-slate-200'
-              }`}
-            >
-              <LayoutDashboard className="w-4 h-4 text-slate-400" />
-              <span>Dashboard</span>
-            </button>
-
-            <button
-              onClick={() => onSelectNav('my_work')}
-              className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium transition cursor-pointer text-left ${
-                activeNav === 'my_work'
-                  ? 'bg-[#182136] text-white font-semibold'
-                  : 'text-slate-400 hover:bg-[#131929] hover:text-slate-200'
-              }`}
-            >
-              <Activity className="w-4 h-4 text-slate-400" />
-              <span>Activity</span>
-            </button>
-          </div>
-
-          {/* SECTION 2: OPERATIONS */}
-          <div className="space-y-1">
-            <div className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-              OPERATIONS
-            </div>
-
-            <button
-              onClick={() => onSelectNav('needs_attention')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition cursor-pointer text-left ${
-                activeNav === 'needs_attention'
-                  ? 'bg-[#182136] text-white font-semibold'
-                  : 'text-slate-400 hover:bg-[#131929] hover:text-slate-200'
-              }`}
-            >
-              <div className="flex items-center space-x-2.5">
-                <AlertTriangle className="w-4 h-4 text-slate-400" />
-                <span>Incidents</span>
-              </div>
-            </button>
-
-            <button
-              onClick={() => onSelectNav('all')}
-              className="w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium text-slate-400 hover:bg-[#131929] hover:text-slate-200 transition cursor-pointer text-left"
-            >
-              <Layers className="w-4 h-4 text-slate-400" />
-              <span>Services</span>
-            </button>
-
-            <button
-              onClick={() => onSelectNav('pending_approval')}
-              className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium transition cursor-pointer text-left ${
-                activeNav === 'pending_approval'
-                  ? 'bg-[#182136] text-white font-semibold'
-                  : 'text-slate-400 hover:bg-[#131929] hover:text-slate-200'
-              }`}
-            >
-              <Bot className="w-4 h-4 text-slate-400" />
-              <span>Agents & Sign-Offs</span>
-            </button>
-          </div>
-
-          {/* SECTION 3: ORGANIZATION */}
-          <div className="space-y-1">
-            <div className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-              ORGANIZATION
-            </div>
-
-            <button
-              onClick={onOpenMembersModal}
-              className="w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium text-slate-400 hover:bg-[#131929] hover:text-slate-200 transition cursor-pointer text-left"
-            >
-              <Users className="w-4 h-4 text-slate-400" />
-              <span>Team</span>
-            </button>
-
-            <button
-              onClick={onOpenMembersModal}
-              className="w-full flex items-center space-x-2.5 px-3 py-2 rounded-lg font-medium text-slate-400 hover:bg-[#131929] hover:text-slate-200 transition cursor-pointer text-left"
-            >
-              <Settings className="w-4 h-4 text-slate-400" />
-              <span>Settings</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Bottom User Pill & Sign Out */}
-      <div className="p-3 border-t border-[#1a2234] bg-[#090d16]/80 flex items-center justify-between text-xs">
-        <div className="flex items-center space-x-2 min-w-0">
-          <div className="w-7 h-7 rounded-full bg-slate-800 text-white flex items-center justify-center font-bold text-xs shrink-0">
-            {user?.name?.[0]?.toUpperCase() || 'U'}
-          </div>
-          <div className="min-w-0">
-            <div className="font-semibold text-slate-200 truncate">{user?.name}</div>
-            <div className="text-[10px] text-slate-400 truncate capitalize">{userRole}</div>
-          </div>
-        </div>
-
-        <button
-          onClick={onLogout}
-          title="Sign out of operations console"
-          className="p-1.5 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-        >
-          <LogOut className="w-4 h-4" />
-        </button>
-      </div>
-    </aside>
+      )}
+    </>
   );
 }

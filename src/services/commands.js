@@ -17,6 +17,7 @@ import {
   invalidAssignee
 } from '../shared/errors.js';
 import { logger } from '../shared/logger.js';
+import { clearDeadlineRemindersForItem, markDeadlineRemindersReadForItem } from './reminderService.js';
 
 export function canonicalJsonHash(method, path, body) {
   const normalizedBody = body ? JSON.stringify(body, Object.keys(body).sort()) : '';
@@ -99,13 +100,14 @@ export async function executeCommand(user, idempotencyKey, requestMeta, commandF
 /**
  * Helper to emit WebSocket notification hint via pg_notify
  */
-async function notifyItemChanged(client, teamId, itemId, version, eventSeq) {
+async function notifyItemChanged(client, teamId, itemId, version, eventSeq, extra = {}) {
   const payload = JSON.stringify({
     type: 'item',
     team_id: String(teamId),
     item_id: String(itemId),
     version: Number(version),
-    event_seq: Number(eventSeq)
+    event_seq: Number(eventSeq),
+    ...extra
   });
   await client.query(`SELECT pg_notify('item_changes', $1)`, [payload]);
 }
@@ -224,7 +226,18 @@ export async function claimWorkItem(user, itemId, requestId, client) {
       [eventRows[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]
     );
 
-    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+    await client.query(
+      `INSERT INTO work_item_assignees (work_item_id, user_id, assigned_by)
+       VALUES ($1, $2, $2)
+       ON CONFLICT (work_item_id, user_id) DO NOTHING`,
+      [item.id, user.id]
+    );
+
+    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+      actor_id: user.id,
+      actor_name: user.name,
+      changed_fields: ['assignee_id', 'status']
+    });
     return { status: 200, body: item };
   }
 
@@ -289,7 +302,16 @@ export async function releaseWorkItem(user, itemId, expectedVersion, requestId, 
       [eventRows[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]
     );
 
-    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+    await client.query(
+      `DELETE FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+      [item.id, user.id]
+    );
+
+    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+      actor_id: user.id,
+      actor_name: user.name,
+      changed_fields: ['assignee_id', 'status']
+    });
     return { status: 200, body: item };
   }
 
@@ -357,7 +379,18 @@ export async function assignWorkItem(user, itemId, targetAssigneeId, expectedVer
       [eventRows[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]
     );
 
-    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+    await client.query(
+      `INSERT INTO work_item_assignees (work_item_id, user_id, assigned_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (work_item_id, user_id) DO NOTHING`,
+      [item.id, targetAssigneeId, user.id]
+    );
+
+    await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+      actor_id: user.id,
+      actor_name: user.name,
+      changed_fields: ['assignee_id', 'status']
+    });
     return { status: 200, body: item };
   }
 
@@ -369,6 +402,159 @@ export async function assignWorkItem(user, itemId, targetAssigneeId, expectedVer
   }
 
   throw invalidTransition(`Cannot assign item in status "${current.status}"`);
+}
+
+/**
+ * ADD CO-ASSIGNEE (Team lead or existing assignee can add co-workers to an item)
+ */
+export async function addWorkItemAssignee(user, itemId, targetUserIdOrIds, expectedVersion, client) {
+  const { rows: existingRows } = await client.query(`SELECT * FROM work_items WHERE id = $1`, [itemId]);
+  if (!existingRows.length) throw notFound('Work item not found');
+  const existing = existingRows[0];
+
+  await assertCan(user, 'add_assignee', existing, { forShare: true }, client);
+
+  const targetIds = Array.isArray(targetUserIdOrIds)
+    ? targetUserIdOrIds.map(String)
+    : [String(targetUserIdOrIds)];
+
+  if (targetIds.length === 0) {
+    throw validationError('At least one user must be specified');
+  }
+
+  // Validate all target users are active members of the team
+  for (const tid of targetIds) {
+    const { rows: targetRows } = await client.query(
+      `SELECT role FROM team_memberships WHERE team_id = $1 AND user_id = $2 AND removed_at IS NULL`,
+      [existing.team_id, tid]
+    );
+    if (!targetRows.length) throw invalidAssignee(`Target user ${tid} is not an active member of this team`);
+  }
+
+  // Insert all co-assignees
+  for (const tid of targetIds) {
+    await client.query(
+      `INSERT INTO work_item_assignees (work_item_id, user_id, assigned_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (work_item_id, user_id) DO NOTHING`,
+      [itemId, tid, user.id]
+    );
+  }
+
+  // If item was open or unassigned, advance to in_progress with first target as primary
+  const count = targetIds.length;
+  let updateSql;
+  let updateParams;
+  if (existing.status === 'open' || !existing.assignee_id) {
+    updateSql = `UPDATE work_items
+      SET assignee_id = $1, status = 'in_progress', version = version + 1,
+          event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+      WHERE id = $2 RETURNING *`;
+    updateParams = [targetIds[0], itemId];
+  } else {
+    updateSql = `UPDATE work_items
+      SET version = version + 1, event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+      WHERE id = $1 RETURNING *`;
+    updateParams = [itemId];
+  }
+
+  const { rows: updatedRows } = await client.query(updateSql, updateParams);
+  const item = updatedRows[0];
+
+  // Fetch target user names for event
+  const numericIds = targetIds.map(Number);
+  const { rows: targetUserRows } = await client.query(
+    `SELECT id, name FROM users WHERE id = ANY($1::bigint[])`,
+    [numericIds]
+  );
+  const nameMap = Object.fromEntries(targetUserRows.map((u) => [String(u.id), u.name]));
+  const targetNames = targetIds.map((tid) => nameMap[tid] || 'Collaborator');
+
+  const { rows: eventRows } = await client.query(
+    `INSERT INTO work_item_events (
+      work_item_id, seq, item_version, actor_id, type, payload
+    ) VALUES ($1, $2, $3, $4, 'assigned', $5) RETURNING id`,
+    [
+      item.id, item.event_seq, item.version, user.id,
+      JSON.stringify({
+        to: targetIds.length === 1 ? targetIds[0] : targetIds,
+        target_name: targetNames.join(', '),
+        action: 'co_assign'
+      })
+    ]
+  );
+
+  await client.query(
+    `INSERT INTO outbox (event_id, type, payload, status)
+     VALUES ($1, 'work_item.assigned', $2, 'pending')`,
+    [eventRows[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]
+  );
+
+  await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+    actor_id: user.id,
+    actor_name: user.name,
+    changed_fields: ['assignees']
+  });
+
+  return { status: 200, body: item };
+}
+
+/**
+ * REMOVE CO-ASSIGNEE
+ */
+export async function removeWorkItemAssignee(user, itemId, targetUserId, expectedVersion, client) {
+  const { rows: existingRows } = await client.query(`SELECT * FROM work_items WHERE id = $1`, [itemId]);
+  if (!existingRows.length) throw notFound('Work item not found');
+  const existing = existingRows[0];
+
+  await assertCan(user, 'remove_assignee', existing, { forShare: true }, client);
+
+  // If caller is not a lead, they can only remove themselves
+  const role = await getTeamRole(user, existing.team_id, client);
+  const isLead = role === 'lead' || user.is_org_admin;
+  if (!isLead && String(user.id) !== String(targetUserId)) {
+    throw forbidden('Only team leads can remove other assignees');
+  }
+
+  // Remove from work_item_assignees
+  await client.query(
+    `DELETE FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+    [itemId, targetUserId]
+  );
+
+  // If this was primary assignee_id, select another remaining assignee or set null/open
+  const { rows: remaining } = await client.query(
+    `SELECT user_id FROM work_item_assignees WHERE work_item_id = $1 LIMIT 1`,
+    [itemId]
+  );
+
+  let newAssigneeId = existing.assignee_id;
+  let newStatus = existing.status;
+  if (String(existing.assignee_id) === String(targetUserId)) {
+    if (remaining.length > 0) {
+      newAssigneeId = remaining[0].user_id;
+    } else {
+      newAssigneeId = null;
+      newStatus = 'open';
+    }
+  }
+
+  const { rows: updatedRows } = await client.query(
+    `UPDATE work_items
+     SET assignee_id = $1, status = $2, version = version + 1,
+         event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+     WHERE id = $3 RETURNING *`,
+    [newAssigneeId, newStatus, itemId]
+  );
+  const item = updatedRows[0];
+
+  await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+    actor_id: user.id,
+    actor_name: user.name,
+    changed_fields: ['assignees']
+  });
+
+  return { status: 200, body: item };
 }
 
 /**
@@ -385,13 +571,24 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
   switch (action) {
     case 'request_approval': {
       if (existing.status !== 'in_progress') throw invalidTransition('request_approval requires status in_progress');
-      if (!existing.requires_approval) throw invalidTransition('Item does not require approval');
+
+      // Check user is an assignee
+      let isAssignee = String(existing.assignee_id) === String(user.id);
+      if (!isAssignee) {
+        const { rows: aRows } = await client.query(
+          `SELECT 1 FROM work_item_assignees WHERE work_item_id = $1 AND user_id = $2`,
+          [itemId, user.id]
+        );
+        isAssignee = aRows.length > 0;
+      }
+      if (!isAssignee) throw forbidden('Only an assignee can request approval');
 
       const { rows } = await client.query(
         `UPDATE work_items
-         SET status = 'pending_approval', approval_requested_by = $1, version = version + 1,
-             event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
-         WHERE id = $2 AND version = $3 AND status = 'in_progress' AND assignee_id = $1
+         SET status = 'pending_approval', requires_approval = true, approval_requested_by = $1,
+             fix_approved = false, fix_approved_by = NULL, fix_approved_at = NULL,
+             version = version + 1, event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+         WHERE id = $2 AND version = $3 AND status = 'in_progress'
          RETURNING *`,
         [user.id, itemId, expectedVersion]
       );
@@ -408,8 +605,16 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
          VALUES ($1, $2, $3, $4, 'approval_requested', $5, $6) RETURNING id`,
         [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason: reason || null }), requestId]
       );
-      await client.query(`INSERT INTO outbox (event_id, type, payload, status) VALUES ($1, 'work_item.approval_requested', $2, 'pending')`, [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]);
-      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+      await client.query(
+        `INSERT INTO outbox (event_id, type, payload, status)
+         VALUES ($1, 'work_item.approval_requested', $2, 'pending')`,
+        [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id, actor_name: user.name })]
+      );
+      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+        actor_id: user.id,
+        actor_name: user.name,
+        changed_fields: ['status']
+      });
       return { status: 200, body: item };
     }
 
@@ -419,8 +624,9 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
       // Separation of duties enforced directly in SQL: approval_requested_by <> caller
       const { rows } = await client.query(
         `UPDATE work_items
-         SET status = 'resolved', approval_requested_by = NULL, resolved_at = now(), version = version + 1,
-             event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+         SET status = 'in_progress', approval_requested_by = NULL,
+             fix_approved = true, fix_approved_by = $3, fix_approved_at = now(),
+             version = version + 1, event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
          WHERE id = $1 AND version = $2 AND status = 'pending_approval' AND approval_requested_by <> $3
          RETURNING *`,
         [itemId, expectedVersion, user.id]
@@ -437,10 +643,19 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
       const { rows: ev } = await client.query(
         `INSERT INTO work_item_events (work_item_id, seq, item_version, actor_id, type, payload, request_id)
          VALUES ($1, $2, $3, $4, 'approved', $5, $6) RETURNING id`,
-        [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason: reason || null }), requestId]
+        [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason: reason || null, approved_by_name: user.name }), requestId]
       );
-      await client.query(`INSERT INTO outbox (event_id, type, payload, status) VALUES ($1, 'work_item.approved', $2, 'pending')`, [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]);
-      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+      await client.query(
+        `INSERT INTO outbox (event_id, type, payload, status)
+         VALUES ($1, 'work_item.approved', $2, 'pending')`,
+        [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id, actor_name: user.name })]
+      );
+      await markDeadlineRemindersReadForItem(client, item.id);
+      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+        actor_id: user.id,
+        actor_name: user.name,
+        changed_fields: ['fix_approved', 'status']
+      });
       return { status: 200, body: item };
     }
 
@@ -452,8 +667,8 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
 
       const { rows } = await client.query(
         `UPDATE work_items
-         SET status = 'in_progress', approval_requested_by = NULL, version = version + 1,
-             event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
+         SET status = 'in_progress', approval_requested_by = NULL, fix_approved = false,
+             version = version + 1, event_seq = event_seq + 1, updated_at = now(), last_activity_at = now()
          WHERE id = $1 AND version = $2 AND status = 'pending_approval' AND approval_requested_by <> $3
          RETURNING *`,
         [itemId, expectedVersion, user.id]
@@ -472,14 +687,24 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
          VALUES ($1, $2, $3, $4, 'rejected', $5, $6) RETURNING id`,
         [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason }), requestId]
       );
-      await client.query(`INSERT INTO outbox (event_id, type, payload, status) VALUES ($1, 'work_item.rejected', $2, 'pending')`, [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]);
-      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+      await client.query(
+        `INSERT INTO outbox (event_id, type, payload, status)
+         VALUES ($1, 'work_item.rejected', $2, 'pending')`,
+        [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id, actor_name: user.name })]
+      );
+      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+        actor_id: user.id,
+        actor_name: user.name,
+        changed_fields: ['status']
+      });
       return { status: 200, body: item };
     }
 
     case 'resolve': {
       if (existing.status !== 'in_progress') throw invalidTransition('resolve requires status in_progress');
-      if (existing.requires_approval) throw invalidTransition('Item requires formal lead approval');
+      if (existing.requires_approval && !existing.fix_approved) {
+        throw invalidTransition('Fix must be approved by a team lead before this item can be resolved');
+      }
 
       const { rows } = await client.query(
         `UPDATE work_items
@@ -502,8 +727,17 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
          VALUES ($1, $2, $3, $4, 'resolved', $5, $6) RETURNING id`,
         [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason: reason || null }), requestId]
       );
-      await client.query(`INSERT INTO outbox (event_id, type, payload, status) VALUES ($1, 'work_item.resolved', $2, 'pending')`, [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]);
-      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
+      await client.query(
+        `INSERT INTO outbox (event_id, type, payload, status)
+         VALUES ($1, 'work_item.resolved', $2, 'pending')`,
+        [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id, actor_name: user.name })]
+      );
+      await markDeadlineRemindersReadForItem(client, item.id);
+      await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq, {
+        actor_id: user.id,
+        actor_name: user.name,
+        changed_fields: ['status']
+      });
       return { status: 200, body: item };
     }
 
@@ -532,6 +766,7 @@ export async function transitionWorkItem(user, itemId, action, expectedVersion, 
         [item.id, item.event_seq, item.version, user.id, JSON.stringify({ reason: reason || null }), requestId]
       );
       await client.query(`INSERT INTO outbox (event_id, type, payload, status) VALUES ($1, 'work_item.closed', $2, 'pending')`, [ev[0].id, JSON.stringify({ work_item_id: item.id, team_id: item.team_id, actor_id: user.id })]);
+      await markDeadlineRemindersReadForItem(client, item.id);
       await notifyItemChanged(client, item.team_id, item.id, item.version, item.event_seq);
       return { status: 200, body: item };
     }
@@ -666,6 +901,15 @@ export async function patchWorkItem(user, itemId, expectedVersion, fields, reque
   const conflictingFields = submittedKeys.filter((k) => interveningChangedFields.has(k));
 
   if (conflictingFields.length > 0) {
+    const { rows: lastEventRows } = await client.query(
+      `SELECT u.name as actor_name
+       FROM work_item_events e
+       JOIN users u ON u.id = e.actor_id
+       WHERE e.work_item_id = $1
+       ORDER BY e.seq DESC LIMIT 1`,
+      [current.id]
+    );
+    current.last_actor_name = lastEventRows[0]?.actor_name || 'Someone';
     throw versionConflict('Concurrent changes to the same fields', current, conflictingFields);
   }
 
@@ -713,7 +957,16 @@ async function applyPatchUpdate(user, current, fields, changes, mergedFromVersio
     [evRows[0].id, JSON.stringify({ work_item_id: updated.id, team_id: updated.team_id, actor_id: user.id })]
   );
 
-  await notifyItemChanged(client, updated.team_id, updated.id, updated.version, updated.event_seq);
+  if ('due_at' in fields) {
+    await clearDeadlineRemindersForItem(client, updated.id);
+  }
+
+  await notifyItemChanged(client, updated.team_id, updated.id, updated.version, updated.event_seq, {
+    actor_id: user.id,
+    actor_name: user.name,
+    changed_fields: Object.keys(fields),
+    item: updated
+  });
 
   const responseBody = {
     ...updated,

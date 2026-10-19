@@ -1,17 +1,42 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
-body {
-  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+@layer base {
+  :root {
+    --color-ink: #0f1f2e;
+    --color-paper: #f4f6f8;
+    --color-card-border: #e2e8f0;
+    --color-cobalt: #2f5bea;
+    --color-cobalt-hover: #264ecc;
+    --color-amber-warn: #d97706;
+    --color-rose-crit: #e11d48;
+    --color-emerald-done: #059669;
+  }
+
+  html {
+    font-size: 16px;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: #0f172a;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    font-size: 1rem; /* 16px default body */
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Tabular numbers for clean numeric/timestamp display */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
 }
 
-/* Restrained, modern scrollbars */
+/* Restrained scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -27,7 +52,18 @@ body {
   background: #94a3b8;
 }
 
+/* Accessible focus visible ring */
 *:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px #4f46e5;
+  outline: 2px solid #2f5bea !important;
+  outline-offset: 2px !important;
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

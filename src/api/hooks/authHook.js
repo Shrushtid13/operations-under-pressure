@@ -5,6 +5,9 @@ import { logger } from '../../shared/logger.js';
 
 const PUBLIC_PREFIXES = [
   '/auth/login',
+  '/auth/register',
+  '/auth/logout',
+  '/workspaces/invitations',
   '/healthz',
   '/readyz'
 ];

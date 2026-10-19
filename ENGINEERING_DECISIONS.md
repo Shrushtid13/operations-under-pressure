@@ -1,88 +1,108 @@
 # Engineering Decisions: Operations Under Pressure
 
-This document details the five most consequential engineering decisions and trade-offs made while designing and building the system to address the Newtonite candidate brief.
+This document details five fundamental architectural and engineering decisions made while designing and implementing the Newtonite Operations platform. Each section outlines the decision, alternatives considered, trade-offs, and rationale.
 
 ---
 
-## 1. PostgreSQL as Single Source of Truth + Transactional Outbox (No Redis/Kafka)
+## 1. Data Structuring: Relational State, Multi-Assignee Normalization, and Immutable Audit Trails
 
 ### Decision
-All operational state, append-only history, idempotency keys, sessions, and asynchronous notification intents are stored in a single PostgreSQL 16 database. Background asynchronous processing (notifications and maintenance) is driven via an Outbox table drained with `FOR UPDATE SKIP LOCKED`.
+The datastore is structured around a normalized relational model in PostgreSQL 16:
+- Core work items (`work_items`) store authoritative mutable state (`version`, `status`, `priority`, `due_at`, `fix_approved`).
+- Multiple collaborators are modeled via a first-class junction table (`work_item_assignees`) with foreign key constraints, enabling concurrent co-assignees while maintaining a primary assignee reference.
+- Every state mutation writes an append-only row to `work_item_events` with contiguous `seq` counters and `item_version` linkages. Database triggers and PostgreSQL role permission restrictions (`REVOKE UPDATE, DELETE ON work_item_events FROM app_runtime`) guarantee that audit records cannot be altered or purged.
+- Discussions and comments advance `seq` and update `last_activity_at`, but do **not** increment `version`.
 
 ### Alternatives Considered
-- Dedicated message brokers (RabbitMQ, Kafka, AWS SQS)
-- In-memory cache/queues (Redis)
-- Synchronous notification fanout during the HTTP mutation request
+- **NoSQL / Document store (MongoDB)**: Storing entire work items as JSON documents.
+- **Full Event Sourcing**: Storing only events and replaying them to derive state.
+- **Post-commit audit logs**: Writing audit entries from application middleware after the commit.
 
 ### Trade-offs & Rationale
-- **Dual-write elimination:** Secondary brokers make atomic dual-writes impossible without distributed transactions (2PC). Emitting state changes to Postgres and notifications to Kafka creates failure modes where database transactions roll back while notifications leak, or vice versa.
-- **Atomic state + intent:** In this architecture, updating item state, appending an audit event, generating an outbox row, and recording the idempotency response happen in **one single database transaction**. If the transaction commits, all artifacts are guaranteed to exist.
-- **Operational simplicity:** Tens of thousands of active work items with hundreds of concurrent users is well within PostgreSQL’s capabilities. Introducing Redis or Kafka would add operational complexity, separate connection management, and multiple points of failure without solving a genuine throughput bottleneck at this scale.
+- **Relational consistency & zero gap auditing**: Writing state changes and event rows in the same transaction guarantees 100% audit integrity—if the transaction commits, both the current state and its immutable audit trail exist.
+- **Why not full event sourcing**: Full event sourcing requires complex projections, read models, and replay snapshots that introduce query lag and operational overhead. In operational centers, operators need instant, sub-millisecond filtering and keyset pagination, which normalized SQL tables provide natively.
+- **Decoupling comments from versioning**: Because comments only bump `seq`, engineers discussing an incident in the comments never trigger spurious `409 VERSION_CONFLICT` errors for an engineer concurrently editing the item's priority or description.
 
 ---
 
-## 2. Optimistic Concurrency via `version` + Atomic Conditional Updates for Claim
+## 2. Handling Concurrent Updates: OCC via `expected_version`, Atomic Claim Locks, and Disjoint Field Merging
 
 ### Decision
-Mutations use PostgreSQL `READ COMMITTED` with atomic conditional `WHERE` clauses (`UPDATE ... WHERE id = $id AND version = $expected AND status = $from`) rather than distributed locks, pessimistic row locks across human think time, or `SERIALIZABLE` isolation. Stale PATCH requests on content fields undergo automated field-level merge when intervening changes are disjoint, or return `409 VERSION_CONFLICT` with `conflicting_fields` when concurrent users edit the same fields.
+Concurrency is managed using **Optimistic Concurrency Control (OCC)** coupled with atomic conditional updates:
+1. **Atomic Claims**: Claiming open work uses conditional row updates (`WHERE id = $id AND status = 'open' AND version = $expected`). Simultaneous claims serialize at PostgreSQL's row locks. Exactly one claimant wins; losers match zero rows and immediately receive a `409 ALREADY_ASSIGNED` response containing the winner’s identity.
+2. **Lost-Update Prevention**: State-modifying requests (`PATCH /work-items/:id`) require an `expected_version`. If a collaborator modified the record in the interim, PostgreSQL detects the version mismatch.
+3. **Disjoint Field-Level Merging**: If intervening changes touched different fields (e.g. user A updated `title` while user B updated `priority`), the server automatically merges the non-conflicting fields within a safe version gap (`MERGE_MAX_GAP = 10`), commits the merged state, and tags the event with `merged_from_version`.
+4. **Draft-Preserving Conflict Resolution**: If both users modified the same field, the server returns `409 VERSION_CONFLICT` with `conflicting_fields` and current server values. The UI presents an interactive resolution dialog ("Take theirs" vs. "Overwrite with mine") without discarding the user's unsaved local draft.
 
 ### Alternatives Considered
-- Pessimistic locking (`SELECT ... FOR UPDATE` held while the user views or edits an item)
-- PostgreSQL `SERIALIZABLE` isolation
-- Last-write-wins (LWW)
+- **Pessimistic locking**: `SELECT ... FOR UPDATE` held while a user views or edits an item.
+- **PostgreSQL `SERIALIZABLE` isolation**: Relying on database serialization failure retries.
+- **Last-Write-Wins (LWW)**: Blindly overwriting records with the latest incoming payload.
 
 ### Trade-offs & Rationale
-- **Human think-time compatibility:** Operational users take seconds or minutes between opening an item and taking action. Holding database row locks during human think-time would exhaust connection pools and freeze concurrent users.
-- **Zero lost updates:** Under conditional updates, simultaneous mutations serialize at the row lock in PostgreSQL. The second committer re-evaluates the `WHERE` predicate after the winner commits, matches zero rows, and the service layer returns a structured 409 conflict containing the current server state, preserving the user's local draft.
-- **Graceful collaboration:** For content edits (PATCH), field-level merge automatically combines disjoint updates (e.g., user A modifies title while user B modifies priority), preventing spurious conflicts while strictly rejecting overlapping modifications.
+- **Human think-time tolerance**: Operational users spend minutes reviewing context, drafting steps, or communicating before submitting changes. Holding database row locks or transactions during human think-time would rapidly exhaust database connection pools and freeze out other collaborators.
+- **Zero data loss**: Last-Write-Wins silently destroys critical information. OCC guarantees that every collaborator is explicitly informed of concurrent modifications, while automatic field merging prevents unnecessary conflict alerts on disjoint edits.
 
 ---
 
-## 3. Append-Only Event Table with Contiguous `seq` and `item_version` (Not Event Sourcing)
+## 3. Synchronous vs. Asynchronous Boundary: Atomic ACID Transactions + Transactional Outbox Pattern
 
 ### Decision
-Every state change writes an event to `work_item_events` in the same transaction. Events are strictly append-only, enforced by both database triggers and restricted database role permissions (`REVOKE UPDATE, DELETE`). Timeline ordering uses a per-item `seq` counter, while state-changing events link to `item_version`. Comments advance `seq` and `last_activity_at`, but leave `version` untouched.
+The system draws a strict boundary between what happens synchronously within the HTTP request lifecycle and what executes asynchronously in background workers:
+- **Synchronous (In-Transaction)**:
+  - Input validation via Ajv JSON Schemas.
+  - Policy Decision Point (PDP) authorization and Separation of Duties checks.
+  - State transitions, version bumps, and append-only event insertion.
+  - Insertion of notification and integration tasks into the `outbox` table.
+  - Idempotency key registration and response payload caching.
+  - PostgreSQL `NOTIFY` broadcast (`pg_notify('item_changes', ...)`) to wake up WebSocket listeners.
+- **Asynchronous (Background Daemon)**:
+  - Draining pending messages from the `outbox` table using `FOR UPDATE SKIP LOCKED`.
+  - Notification deduplication (`UNIQUE (user_id, event_id, kind)`) and dispatch.
+  - Periodic scans for approaching (24h) and overdue deadlines via `reminderService`.
+  - Garbage collection of expired sessions and idempotency keys.
 
 ### Alternatives Considered
-- Full Event Sourcing (deriving state solely by replaying events)
-- Post-commit audit logging via middleware
-- Trigger-only audit history
+- Synchronous notification generation and dispatch during the HTTP mutation.
+- Offloading event publishing to external distributed message brokers (RabbitMQ, Kafka, AWS SQS).
 
 ### Trade-offs & Rationale
-- **Auditable trustworthiness:** Management and compliance require an immutable record of who changed what and why a decision was made. Middleware logs can fail or lose context if the application crashes post-commit. In-transaction event insertion guarantees 100% audit completeness.
-- **Why not full event sourcing:** The brief requires high query performance on lists, filters, and search. Event sourcing would introduce projections, read models, and replay machinery that add immense complexity without product benefit. Current state lives authoritatively in `work_items`, while `work_item_events` provides the audit trail.
-- **Separation of comments from versioning:** Because comments only advance `seq` and do not bump `version`, users collaborating in discussion never cause spurious `409 VERSION_CONFLICT` errors for an engineer editing the item description or priority.
+- **Dual-write elimination**: Dispatching notifications or publishing to external message queues inside an HTTP handler creates unavoidable dual-write bugs. If PostgreSQL commits but the message broker fails, the event is lost; if the message is published but PostgreSQL rolls back, ghost notifications are sent. Writing outbox rows inside the **exact same ACID transaction** as the business mutation guarantees that notifications are produced if and only if the state change succeeds.
+- **Fast, predictable HTTP latency**: API response times remain low and independent of downstream notification consumers.
 
 ---
 
-## 4. Single Resource-Level Authorization Policy with SQL-Scoped Listings
+## 4. Authorization Architecture: Centralized PDP, SQL-Scoped Multi-Tenancy, and Strict Assignee Resolution
 
 ### Decision
-Authorization is enforced via a single resource-level policy (`can(user, action, workItem)`) evaluated inside the transaction using database-loaded roles. Non-members receive a `404 NOT_FOUND` (preventing existence leaks), while users with insufficient role receive a `403 FORBIDDEN`. All list queries enforce team scoping directly in SQL (`team_id IN (SELECT ... FROM team_memberships WHERE user_id = $me AND removed_at IS NULL)`).
+Authorization follows the **Policy Decision Point (PDP) / Policy Enforcement Point (PEP)** pattern implemented in `src/services/policy.js`:
+1. **Hierarchical RBAC**: Scoped team roles follow `viewer` (10) < `member` (20) < `lead` (30) < `org_admin` (40).
+2. **Multi-Tenant Isolation**: Tenant and team boundaries are enforced directly in SQL (`WHERE team_id IN (SELECT team_id FROM team_memberships WHERE user_id = $me AND removed_at IS NULL)`). Requests for unauthorized items return `404 NOT_FOUND` rather than `403 FORBIDDEN` to prevent resource existence leakage.
+3. **Separation of Duties (SoD)**: For work items requiring approval, the lead who signs off cannot be the person who requested approval (`approval_requested_by <> caller.id`).
+4. **Assignee-Only Resolution**: Team leads can approve fixes, which transitions the item back to `in_progress` with `fix_approved = true`. However, leads are **strictly forbidden** from resolving work; the `resolve` action can only be executed by a user currently assigned to the job.
 
 ### Alternatives Considered
-- Role-based Access Control (RBAC) claims encoded in JWT tokens
-- Dedicated policy engine (OPA / Casbin)
-- Filtering results in application memory after fetching
+- Embedding role claims inside stateless JWT tokens.
+- Third-party authorization frameworks (OPA, Casbin).
+- Allowing team leads to resolve any work item directly without assignee verification.
 
 ### Trade-offs & Rationale
-- **Immediate revocation:** Encoding team roles in stateless tokens creates a window where a demoted or removed employee can continue mutating sensitive items until token expiry. Querying memberships inside the transaction (under row locks) guarantees that role revocation takes effect on the very next request.
-- **Information leak prevention:** Hiding UI buttons is insufficient. Scoping queries in SQL guarantees that crafted API requests cannot discover work items, notifications, or team names outside the caller’s authorized teams.
-- **Strict Separation of Duties:** For items requiring formal approval, the SQL update requires `approval_requested_by <> caller.id`, ensuring at the database level that leads cannot sign off on their own requests.
+- **Immediate permission revocation**: Storing roles in JWTs creates a security window where demoted or removed users can continue mutating critical items until token expiration. Validating session tokens against PostgreSQL and querying current memberships inside the transaction ensures instant revocation.
+- **Operational accountability**: Forcing the active assignee to perform the final resolution ensures that the engineer who executed the fix verifies the solution in practice, preventing premature closures by management.
 
 ---
 
-## 5. Keyset Pagination + Server-Defined Attention Metrics + Partial Indexes
+## 5. What Was Intentionally Not Built (and Why)
 
 ### Decision
-Listings use keyset pagination based on `(priority, updated_at, id)` or `(updated_at, id)` instead of `OFFSET / LIMIT`. "Needs Attention" is defined authoritatively on the server. Active items are indexed using PostgreSQL partial indexes (`WHERE status IN ('open', 'in_progress', 'pending_approval')`).
-
-### Alternatives Considered
-- Traditional `OFFSET / LIMIT` pagination
-- Client-side filtering and full-dataset loading
-- Elasticsearch / external search cluster
-
-### Trade-offs & Rationale
-- **Scale and stable pagination:** `OFFSET` queries degrade as history grows into hundreds of thousands of items because PostgreSQL must scan and discard all preceding rows. Keyset pagination uses row-value comparisons on indexed tuples, maintaining constant query time regardless of page depth, while remaining immune to duplicate or skipped items during concurrent inserts.
-- **Consistent attention metrics:** Defining attention rules in the backend (unassigned high-priority work, overdue items, stale work with no activity for 3 days, and pending approvals) ensures that all clients and automated monitors have an identical, testable definition of what requires action.
-- **Small working set:** By indexing only active items via partial indexes, history can grow to millions of closed rows without inflating index size or slowing down active operations dashboards.
+Several common architectural choices and features were deliberately excluded:
+1. **No Redis or External Message Broker (Kafka / RabbitMQ)**:
+   - *Rationale*: A single PostgreSQL 16 database running `FOR UPDATE SKIP LOCKED` for the transactional outbox and `LISTEN / NOTIFY` for real-time WebSocket hints handles thousands of concurrent operations with zero external infrastructure dependencies. Adding Redis or Kafka would introduce network boundaries, separate clustering, connection pool tuning, and dual-write failure modes without providing meaningful throughput benefits at this scale.
+2. **No Full In-Memory State Synchronization or Operational Transformation (OT/CRDTs)**:
+   - *Rationale*: Collaborative rich text editing (Google Docs style) is unnecessary for structured operations work items (titles, descriptions, priorities, deadlines). Field-level merging with OCC provides robust multi-user collaboration without the complexity and memory overhead of CRDTs.
+3. **No Blind Client-Side `OFFSET / LIMIT` Pagination**:
+   - *Rationale*: `OFFSET` degrades query performance on large tables ($O(N)$ row scan) and causes missing or duplicate rows when items are created or deleted during pagination. Keyset pagination on `(priority, updated_at, id)` guarantees $O(1)$ index lookups regardless of query depth.
+4. **No Ephemeral WebSocket Replay Buffer**:
+   - *Rationale*: WebSocket messages are treated strictly as **lightweight cache invalidation hints** (`{ type: 'item', team_id, item_id, version }`). The client's TanStack Query cache automatically refetches the authoritative state via REST upon receiving a hint or reconnecting. This eliminates the need for distributed WebSocket state stores or sticky sessions.
+5. **No Client-Side Authorization Logic as a Source of Truth**:
+   - *Rationale*: While the UI conditionally hides buttons for clean UX, all authorization policies are enforced authoritatively on the server. No client parameter can bypass server-side role checks, separation of duties, or assignee resolution guards.

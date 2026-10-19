@@ -44,7 +44,27 @@ describe('Workflow, Security, Audit & Invariants Tests', () => {
       payload: { action: 'approve', expected_version: item.version, reason: 'Reviewed and verified.' }
     });
     expect(resAlice.statusCode).toBe(200);
-    expect(resAlice.json().status).toBe('resolved');
+    expect(resAlice.json().fix_approved).toBe(true);
+    expect(resAlice.json().status).toBe('in_progress');
+
+    // Non-assignee (even lead) cannot resolve; only current assignee can resolve
+    const resAliceResolve = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(alice.cookieHeader, `resolve-${crypto.randomUUID()}`),
+      payload: { action: 'resolve', expected_version: resAlice.json().version }
+    });
+    expect(resAliceResolve.statusCode).toBe(403);
+
+    // Charlie (the current assignee) marks the approved fix resolved
+    const resCharlieResolve = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(charlie.cookieHeader, `resolve-${crypto.randomUUID()}`),
+      payload: { action: 'resolve', expected_version: resAlice.json().version }
+    });
+    expect(resCharlieResolve.statusCode).toBe(200);
+    expect(resCharlieResolve.json().status).toBe('resolved');
 
     // Reset and test self-approval rejection:
     // Have Bob request approval on another item, then attempt to approve it himself
@@ -217,5 +237,103 @@ describe('Workflow, Security, Audit & Invariants Tests', () => {
     });
     expect(resRemove.statusCode).toBe(409);
     expect(resRemove.json().code).toBe('MEMBER_HAS_ACTIVE_ITEMS');
+  });
+
+  // Test #21: Multiple assignees on one job & co-assignee resolution
+  it('21. Multiple assignees: lead can assign 2+ people, co-assignee can submit fix and resolve after approval', async () => {
+    // 1. Create a work item in OPS team
+    const opsTeamRes = await pool.query(`SELECT id FROM teams WHERE key = 'OPS'`);
+    const opsTeamId = opsTeamRes.rows[0].id;
+
+    const resCreate = await app.inject({
+      method: 'POST',
+      url: `/teams/${opsTeamId}/work-items`,
+      headers: authHeaders(alice.cookieHeader, `co-create-${crypto.randomUUID()}`),
+      payload: {
+        title: 'Collaborative penetration testing',
+        kind: 'incident',
+        priority: 3
+      }
+    });
+    expect(resCreate.statusCode).toBe(201);
+    const item = resCreate.json();
+
+    // 2. Alice (Lead) assigns two people (Charlie and Bob) at once
+    const resCoAssign = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/assignees`,
+      headers: authHeaders(alice.cookieHeader, `co-assign-${crypto.randomUUID()}`),
+      payload: {
+        user_ids: [charlie.user.id, bob.user.id]
+      }
+    });
+    expect(resCoAssign.statusCode).toBe(200);
+
+    // 3. Detail includes both assignees
+    const resDetail = await app.inject({
+      method: 'GET',
+      url: `/work-items/${item.id}`,
+      headers: authHeaders(alice.cookieHeader)
+    });
+    expect(resDetail.statusCode).toBe(200);
+    const detail = resDetail.json();
+    expect(detail.assignees.length).toBe(2);
+    const assigneeIds = detail.assignees.map((a) => String(a.id));
+    expect(assigneeIds).toContain(String(charlie.user.id));
+    expect(assigneeIds).toContain(String(bob.user.id));
+    expect(detail.status).toBe('in_progress');
+
+    // 4. Bob (co-assignee) submits fix for approval
+    const resReq = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(bob.cookieHeader, `bob-req-${crypto.randomUUID()}`),
+      payload: {
+        action: 'request_approval',
+        expected_version: detail.version,
+        reason: 'Patched SSL cert and verified'
+      }
+    });
+    expect(resReq.statusCode).toBe(200);
+    expect(resReq.json().status).toBe('pending_approval');
+
+    // 5. Alice (Lead) approves fix -> status returns to in_progress with fix_approved = true
+    const resApprove = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(alice.cookieHeader, `alice-appr-${crypto.randomUUID()}`),
+      payload: {
+        action: 'approve',
+        expected_version: resReq.json().version
+      }
+    });
+    expect(resApprove.statusCode).toBe(200);
+    expect(resApprove.json().fix_approved).toBe(true);
+    expect(resApprove.json().status).toBe('in_progress');
+
+    // 6. Alice (Lead, non-assignee) CANNOT mark as resolved (only assignees can resolve!)
+    const resAliceResolve = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(alice.cookieHeader, `alice-res-${crypto.randomUUID()}`),
+      payload: {
+        action: 'resolve',
+        expected_version: resApprove.json().version
+      }
+    });
+    expect(resAliceResolve.statusCode).toBe(403);
+
+    // 7. Charlie (co-assignee) CAN mark as resolved
+    const resCharlieResolve = await app.inject({
+      method: 'POST',
+      url: `/work-items/${item.id}/transition`,
+      headers: authHeaders(charlie.cookieHeader, `charlie-res-${crypto.randomUUID()}`),
+      payload: {
+        action: 'resolve',
+        expected_version: resApprove.json().version
+      }
+    });
+    expect(resCharlieResolve.statusCode).toBe(200);
+    expect(resCharlieResolve.json().status).toBe('resolved');
   });
 });

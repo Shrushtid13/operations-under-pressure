@@ -11,6 +11,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/auth': 'http://127.0.0.1:3000',
+      '/workspaces': 'http://127.0.0.1:3000',
       '/work-items': 'http://127.0.0.1:3000',
       '/teams': 'http://127.0.0.1:3000',
       '/overview': 'http://127.0.0.1:3000',

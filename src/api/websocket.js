@@ -148,7 +148,12 @@ export function registerWebSocketGateway(app) {
               team_id: payload.team_id,
               item_id: payload.item_id,
               version: payload.version,
-              event_seq: payload.event_seq
+              event_seq: payload.event_seq,
+              actor_id: payload.actor_id,
+              actor_name: payload.actor_name,
+              changed_fields: payload.changed_fields,
+              item: payload.item,
+              is_attachment_change: Boolean(payload.is_attachment_change)
             });
           } else if (msg.channel === 'user_notifications') {
             // payload is just a user_id string
@@ -165,6 +170,24 @@ export function registerWebSocketGateway(app) {
 
             // Broadcast membership hint to the team
             broadcastToTeam(payload.team_id, { type: 'membership', team_id: payload.team_id });
+          } else if (msg.channel === 'team_chat') {
+            // Broadcast new chat message hint to all active team sockets
+            broadcastToTeam(payload.team_id, {
+              type: 'chat',
+              team_id: payload.team_id,
+              message_id: payload.message_id
+            });
+          } else if (msg.channel === 'team_calls') {
+            // Broadcast instant call alert to team sockets for floating notification
+            broadcastToTeam(payload.team_id, {
+              type: 'call',
+              team_id: payload.team_id,
+              call_id: payload.call_id,
+              title: payload.title,
+              meeting_url: payload.meeting_url,
+              platform: payload.platform,
+              creator_name: payload.creator_name
+            });
           }
         } catch (err) {
           logger.error({ err, channel: msg.channel }, 'Error processing pg_notify');
@@ -186,6 +209,8 @@ export function registerWebSocketGateway(app) {
       await listenerClient.query('LISTEN item_changes');
       await listenerClient.query('LISTEN user_notifications');
       await listenerClient.query('LISTEN membership_changes');
+      await listenerClient.query('LISTEN team_chat');
+      await listenerClient.query('LISTEN team_calls');
       listenerHealthy = true;
       logger.info('WebSocket LISTEN connection established');
     } catch (err) {
@@ -240,14 +265,17 @@ export function registerWebSocketGateway(app) {
     }
   }
 
-  // Heartbeat: ping every 25s, close dead sockets
+  // Heartbeat: ping and send lightweight application heartbeat frame every 20s to prevent proxy/browser idle disconnects
   heartbeatInterval = setInterval(() => {
     for (const [ws, meta] of socketMeta.entries()) {
       if (ws.readyState === 1) {
-        ws.ping();
+        try {
+          ws.ping();
+          ws.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() }));
+        } catch {}
       }
     }
-  }, config.ws.heartbeatIntervalMs);
+  }, Math.min(config.ws.heartbeatIntervalMs, 20000));
 
   // Session re-validation every 30s
   revalidateInterval = setInterval(async () => {

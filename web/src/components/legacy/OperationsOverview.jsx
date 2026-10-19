@@ -301,6 +301,12 @@ export function OperationsOverview({
                 item.due_at &&
                 new Date(item.due_at) < new Date() &&
                 ['open', 'in_progress', 'pending_approval'].includes(item.status);
+              const isApproaching =
+                item.due_at &&
+                !isOverdue &&
+                new Date(item.due_at) - new Date() <= 24 * 3600 * 1000 &&
+                new Date(item.due_at) > new Date() &&
+                ['open', 'in_progress', 'pending_approval'].includes(item.status);
 
               return (
                 <div
@@ -360,13 +366,17 @@ export function OperationsOverview({
                   </div>
 
                   {/* SLA / Updated */}
-                  <div className="col-span-1 text-right text-xs text-slate-400">
+                  <div className="col-span-1 text-right text-xs">
                     {isOverdue ? (
                       <span className="text-rose-600 font-bold flex items-center justify-end gap-1">
                         <Clock className="w-3.5 h-3.5" /> Overdue
                       </span>
+                    ) : isApproaching ? (
+                      <span className="text-amber-600 font-bold flex items-center justify-end gap-1">
+                        <Clock className="w-3.5 h-3.5" /> Due soon
+                      </span>
                     ) : (
-                      <span>{new Date(item.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      <span className="text-slate-400">{new Date(item.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                     )}
                   </div>
                 </div>

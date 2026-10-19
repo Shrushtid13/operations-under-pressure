@@ -166,6 +166,12 @@ export function WorkItemList({
               item.due_at &&
               new Date(item.due_at) < new Date() &&
               ['open', 'in_progress', 'pending_approval'].includes(item.status);
+            const isApproaching =
+              item.due_at &&
+              !isOverdue &&
+              new Date(item.due_at) - new Date() <= 24 * 3600 * 1000 &&
+              new Date(item.due_at) > new Date() &&
+              ['open', 'in_progress', 'pending_approval'].includes(item.status);
 
             return (
               <div
@@ -222,6 +228,11 @@ export function WorkItemList({
                     {isOverdue && (
                       <span className="text-rose-400 font-medium flex items-center gap-1">
                         <Clock className="w-3 h-3" /> Overdue
+                      </span>
+                    )}
+                    {isApproaching && (
+                      <span className="text-amber-400 font-medium flex items-center gap-1">
+                        <Clock className="w-3 h-3" /> Due soon
                       </span>
                     )}
                     <span>Updated {new Date(item.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>

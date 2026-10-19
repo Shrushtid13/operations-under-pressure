@@ -1,138 +1,120 @@
 // web/src/components/Header.jsx
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   Bell,
-  Moon,
+  Menu,
   Plus,
   Search,
-  Sun,
   X
 } from 'lucide-react';
 
 export function Header({
-  viewTitle,
-  breadcrumbs = [],
+  workspaceName,
+  onOpenWorkspace,
   searchValue,
   onSearchChange,
-  unreadCount,
-  onOpenNotifications,
-  onOpenCreateModal,
+  isLive,
+  unreadCount = 0,
+  onOpenInbox,
+  onOpenNewItem,
   canCreate,
-  user,
-  selectedTeam,
-  theme = 'light',
-  onToggleTheme
+  onOpenMobileMenu
 }) {
-  const isLight = theme === 'light';
+  const searchInputRef = useRef(null);
+
+  // Global hotkey: press '/' to focus search input
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.key === '/' && document.activeElement !== searchInputRef.current && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   return (
-    <header className={`h-16 px-6 flex items-center justify-between sticky top-0 z-30 transition-colors ${
-      isLight
-        ? 'bg-white/95 backdrop-blur-md border-b border-slate-200 text-slate-800'
-        : 'bg-[#0a0e17]/95 backdrop-blur-md border-b border-[#1e293b] text-slate-100'
-    }`}>
-      {/* Left: View Breadcrumbs / Title or Search Bar */}
-      <div className="flex items-center space-x-6 flex-1 max-w-2xl">
-        {/* Search Input directly in header as in reference screenshot */}
-        <div className="relative w-72 sm:w-96">
-          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+    <header className="h-18 px-6 sm:px-8 bg-[#f4f6f8] border-b border-[#e2e8f0] flex items-center justify-between sticky top-0 z-10 select-none">
+      {/* Left: Mobile hamburger + Workspace Pill + Search Input */}
+      <div className="flex items-center space-x-3 flex-1 max-w-xl">
+        <button
+          onClick={onOpenMobileMenu}
+          className="md:hidden p-2.5 rounded-xl text-slate-600 hover:bg-slate-200 transition cursor-pointer"
+          title="Open menu"
+        >
+          <Menu className="w-5 h-5" />
+        </button>
+
+        {workspaceName && (
+          <button
+            onClick={onOpenWorkspace}
+            className="hidden lg:flex items-center space-x-2 px-3 py-2 rounded-xl bg-white border border-[#e2e8f0] hover:border-slate-300 transition text-slate-800 text-xs font-semibold cursor-pointer shadow-xs shrink-0"
+            title="Current workspace · Click to switch or create"
+          >
+            <span className="w-2 h-2 rounded-full bg-[#2f5bea]"></span>
+            <span className="truncate max-w-[140px]">{workspaceName}</span>
+          </button>
+        )}
+
+        <div className="relative w-full max-w-md">
+          <Search className="w-4.5 h-4.5 text-slate-400 absolute left-4 top-3.5" />
           <input
+            ref={searchInputRef}
             type="text"
-            placeholder="Search incidents, services, or agents..."
+            placeholder="Search work (press /)"
             value={searchValue || ''}
             onChange={(e) => onSearchChange(e.target.value)}
-            className={`w-full text-xs pl-8 pr-7 py-2 rounded-lg focus:outline-none transition ${
-              isLight
-                ? 'bg-slate-50 border border-slate-200 text-slate-800 focus:bg-white focus:border-indigo-500 placeholder-slate-400'
-                : 'bg-[#111726] border border-[#222f46] text-slate-200 focus:border-sky-500 placeholder-slate-500'
-            }`}
+            className="w-full bg-white border border-[#e2e8f0] rounded-2xl pl-11 pr-10 py-3 text-[15px] text-slate-900 placeholder-slate-400 focus:outline-none focus:border-[#2f5bea] shadow-xs transition"
           />
           {searchValue && (
             <button
               onClick={() => onSearchChange('')}
-              className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
+              className="absolute right-3.5 top-3.5 text-slate-400 hover:text-slate-600 cursor-pointer"
             >
-              <X className="w-3.5 h-3.5" />
+              <X className="w-4 h-4" />
             </button>
           )}
         </div>
-
-        {/* View Breadcrumb / Title */}
-        <div className="hidden lg:flex items-center space-x-2 text-xs">
-          {breadcrumbs.map((crumb, idx) => (
-            <React.Fragment key={idx}>
-              {crumb.onClick ? (
-                <button
-                  onClick={crumb.onClick}
-                  className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition font-medium cursor-pointer"
-                >
-                  {crumb.label}
-                </button>
-              ) : (
-                <span className="text-slate-400 font-medium">{crumb.label}</span>
-              )}
-              <span className="text-slate-300 dark:text-slate-600">/</span>
-            </React.Fragment>
-          ))}
-          <span className="font-semibold text-slate-700 dark:text-slate-200">{viewTitle}</span>
-        </div>
       </div>
 
-      {/* Right: Theme Toggle + Notifications Bell + Create Button + User Profile */}
-      <div className="flex items-center space-x-4">
-        {/* Theme Toggle (Light / Dark) */}
-        <button
-          onClick={onToggleTheme}
-          title={isLight ? 'Switch to Dark Ops Mode' : 'Switch to Light Studio Mode'}
-          className={`p-2 rounded-lg transition cursor-pointer ${
-            isLight
-              ? 'hover:bg-slate-100 text-slate-500'
-              : 'hover:bg-[#151d2e] text-slate-400'
-          }`}
-        >
-          {isLight ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4 text-amber-400" />}
-        </button>
+      {/* Right: Live indicator + Bell unread count + New work item button */}
+      <div className="flex items-center space-x-5 pl-4">
+        {/* Live status indicator */}
+        <div className="flex items-center space-x-2 text-[14.5px] text-slate-600 font-medium">
+          <span
+            className={`w-2.5 h-2.5 rounded-full ${
+              isLive ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'
+            }`}
+          />
+          <span className="hidden sm:inline">
+            {isLive ? 'Live' : 'Polling'}
+          </span>
+        </div>
 
-        {/* Notifications Bell */}
+        {/* Notification Bell */}
         <button
-          onClick={onOpenNotifications}
-          className={`relative p-2 rounded-lg transition cursor-pointer ${
-            isLight
-              ? 'hover:bg-slate-100 text-slate-500'
-              : 'hover:bg-[#151d2e] text-slate-400'
-          }`}
-          title="Notifications & Activity"
+          onClick={onOpenInbox}
+          className="relative p-2.5 rounded-xl text-slate-600 hover:bg-white hover:text-slate-900 border border-transparent hover:border-[#e2e8f0] transition cursor-pointer"
+          title="Inbox"
         >
-          <Bell className="w-4 h-4" />
+          <Bell className="w-5 h-5" />
           {unreadCount > 0 && (
-            <span className="absolute 1.5 top-1.5 right-1.5 w-2 h-2 bg-rose-500 rounded-full ring-2 ring-white dark:ring-[#0a0e17]"></span>
+            <span className="absolute -top-1 -right-1 min-w-[20px] h-[20px] px-1.5 rounded-full bg-rose-600 text-white text-[11px] font-bold flex items-center justify-center tabular-nums shadow-xs">
+              {unreadCount > 99 ? '99+' : unreadCount}
+            </span>
           )}
         </button>
 
-        {/* Primary Action Button */}
+        {/* Primary Action Button: Cobalt */}
         {canCreate && (
           <button
-            onClick={onOpenCreateModal}
-            className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-sm cursor-pointer"
+            onClick={onOpenNewItem}
+            className="px-5 py-3 bg-[#2f5bea] hover:bg-[#264ecc] text-white text-[15px] font-semibold rounded-2xl flex items-center space-x-2.5 transition shadow-xs cursor-pointer whitespace-nowrap"
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">New Incident</span>
+            <Plus className="w-4.5 h-4.5" />
+            <span>New work item</span>
           </button>
-        )}
-
-        {/* User Profile (matches reference screenshot: Avatar + Name + Role) */}
-        {user && (
-          <div className="flex items-center space-x-2.5 pl-2 border-l border-slate-200 dark:border-slate-800">
-            <div className="w-8 h-8 rounded-full bg-slate-800 text-white flex items-center justify-center text-xs font-bold ring-2 ring-slate-100 dark:ring-slate-700">
-              {user.name?.[0]?.toUpperCase() || 'U'}
-            </div>
-            <div className="hidden sm:block text-left text-xs leading-tight">
-              <div className="font-semibold text-slate-800 dark:text-slate-100">{user.name}</div>
-              <div className="text-[11px] text-slate-400 capitalize">
-                {user.is_org_admin ? 'Admin' : selectedTeam?.role || 'Engineer'}
-              </div>
-            </div>
-          </div>
         )}
       </div>
     </header>

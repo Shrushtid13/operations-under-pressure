@@ -8,12 +8,14 @@ node_modules/
 .env.local
 .env.*.local
 *.env
+!.env.example
 
-# Build outputs
+# Build & Bundler outputs
 dist/
 dist-ssr/
 web/dist/
 build/
+.vite/
 *.tsbuildinfo
 
 # Logs & debugging
@@ -25,10 +27,12 @@ yarn-error.log*
 pino.log
 outbox-dead-letter.log
 
-# Database backups & local data
+# Database backups & local data (keeps directory structure)
 backups/*.sql
 backups/*.tar
 backups/*.gz
+backups/*.dump
+!backups/.gitkeep
 db/data/
 postgres-data/
 
@@ -36,8 +40,9 @@ postgres-data/
 coverage/
 .nyc_output/
 *.lcov
+.vitest/
 
-# Editor & OS files
+# Editor & IDE files
 .DS_Store
 Thumbs.db
 .idea/
@@ -47,6 +52,7 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+*.swp
 
 # Temporary / Scratch files
 tmp/

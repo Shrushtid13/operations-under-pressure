@@ -17,11 +17,12 @@ import workItemRoutes from './routes/workItemRoutes.js';
 import teamRoutes from './routes/teamRoutes.js';
 import overviewRoutes from './routes/overviewRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
+import workspaceRoutes from './routes/workspaceRoutes.js';
 import { registerWebSocketGateway } from './websocket.js';
 
 export async function buildApp() {
   const app = Fastify({
-    bodyLimit: 64 * 1024, // 64 KB limit
+    bodyLimit: 15 * 1024 * 1024, // 15 MB limit for document and PDF attachments
     genReqId: () => crypto.randomUUID(),
     trustProxy: true
   });
@@ -60,6 +61,19 @@ export async function buildApp() {
   await app.register(fastifyWebsocket, {
     options: {
       maxPayload: 1024 // 1 KB inbound limit per §10.4
+    }
+  });
+
+  // Handle empty or stringified JSON bodies gracefully
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    if (!body || body.trim() === '') {
+      return done(null, {});
+    }
+    try {
+      done(null, JSON.parse(body));
+    } catch (err) {
+      err.statusCode = 400;
+      done(err, undefined);
     }
   });
 
@@ -144,6 +158,7 @@ export async function buildApp() {
   await app.register(teamRoutes, { prefix: '/teams' });
   await app.register(overviewRoutes, { prefix: '/overview' });
   await app.register(notificationRoutes, { prefix: '/notifications' });
+  await app.register(workspaceRoutes, { prefix: '/workspaces' });
 
   // 9. WebSocket Gateway registration
   const wsGateway = registerWebSocketGateway(app);
