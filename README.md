@@ -10,7 +10,7 @@ An operational coordination and work-item management platform engineered for hig
 
 ---
 
-## 🚀 Live Demo
+##  Live Demo
 
 **Live Application:** [Operations Under Pressure](https://operations-under-pressure-eight.vercel.app/)
 
